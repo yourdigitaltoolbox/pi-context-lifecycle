@@ -84,6 +84,11 @@ export interface WakeDisposition {
   code: string;
 }
 
+export interface ReleaseWatermark {
+  watermark: number;
+  heldCount: number;
+}
+
 export interface ReleasePermit {
   readonly protocolVersion: 1;
   readonly sessionId: string;
@@ -91,6 +96,7 @@ export interface ReleasePermit {
   readonly operationId: string;
   readonly releaseId: string;
   readonly consumerId: string;
+  readonly cut: ReleaseWatermark;
 }
 
 export interface DrainAck {
@@ -98,12 +104,15 @@ export interface DrainAck {
   consumerId: string;
   disposition: "empty" | "submitted" | "blocked";
   submittedCount: number;
+  handledCount: number;
+  handledThrough: number;
 }
 
 export interface DrainerRegistration {
   consumerId: string;
   priority: number;
   generationId: string;
+  capture(): ReleaseWatermark;
   drain(permit: ReleasePermit): Promise<DrainAck> | DrainAck;
 }
 

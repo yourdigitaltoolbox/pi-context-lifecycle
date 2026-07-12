@@ -23,6 +23,7 @@ export {
   type Phase,
   type RegistryState,
   type ReleasePermit,
+  type ReleaseWatermark,
   type RepairAction,
   type RepairActor,
   type RepairChannel,

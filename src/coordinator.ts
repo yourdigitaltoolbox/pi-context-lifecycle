@@ -14,6 +14,7 @@ import type {
   ReleasePermit,
   RepairDisposition,
   RepairRequest,
+  ReleaseWatermark,
   Snapshot,
   WakeAdmission,
   WakeDisposition,
@@ -50,6 +51,11 @@ interface ActiveOperation {
 
 interface RegisteredDrainer extends DrainerRegistration {
   token: symbol;
+}
+
+interface CapturedDrainer {
+  registration: RegisteredDrainer;
+  cut: ReleaseWatermark;
 }
 
 export const DEFAULT_COMPACTION_INSTRUCTIONS = [
@@ -102,7 +108,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private readonly records: DiagnosticRecord[] = [];
   private readonly drainers = new Map<string, RegisteredDrainer>();
   private readonly activePermits = new Set<ReleasePermit>();
-  private releaseCut: RegisteredDrainer[] | undefined;
+  private releaseCut: CapturedDrainer[] | undefined;
   private releaseIndex = 0;
   private blockedDrainerConsumerId: string | undefined;
   private compactionWarningTimer: ReturnType<typeof setTimeout> | undefined;
@@ -234,17 +240,18 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
 
   onSessionBeforeCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
     if (!this.isCurrentGeneration(generationId)) return;
-    if (reason === "manual") {
-      if (this.phase === "compacting" && this.operation?.managed) this.record("managed-compaction-preflight-observed");
+    if (reason === "manual" && this.phase === "compacting" && this.operation?.managed) {
+      this.record("managed-compaction-preflight-observed");
       return;
     }
     if (this.phase !== "idle" || this.operation !== undefined) {
-      this.block("automatic-compaction-overlapped-active-operation");
+      this.block(reason === "manual" ? "builtin-compaction-overlapped-active-operation" : "automatic-compaction-overlapped-active-operation");
       return;
     }
+    const observedReason: CompactionReason = reason === "manual" ? "builtin" : reason;
     this.operation = {
       id: randomUUID(),
-      reason,
+      reason: observedReason,
       managed: false,
       originOwnerInstanceId: this.ownerInstanceId,
       startedAt: Date.now(),
@@ -261,14 +268,15 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       this.block("claim-persist-failed", false);
       return;
     }
-    this.transition("automatic-compaction-preflight-observed");
+    this.transition(reason === "manual" ? "builtin-compaction-preflight-observed" : "automatic-compaction-preflight-observed");
     this.scheduleCompactionDeadlines(this.operation.id);
   }
 
   onSessionCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
     if (!this.isCurrentGeneration(generationId) || !this.operation) return;
     if (reason !== "manual") {
-      if (this.operation.managed || this.operation.reason !== reason || this.phase !== "observed-preflight") {
+      const resolvesDeadlineBlock = this.phase === "blocked-unknown" && this.blockedReason === "compaction-deadline";
+      if (this.operation.managed || this.operation.reason !== reason || (this.phase !== "observed-preflight" && !resolvesDeadlineBlock)) {
         this.block("automatic-compaction-event-mismatch");
         return;
       }
@@ -278,11 +286,23 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         this.block("claim-persist-failed", false);
         return;
       }
-      this.record("automatic-compaction-succeeded");
-      void this.release();
+      this.record(resolvesDeadlineBlock ? "late-automatic-compaction-success" : "automatic-compaction-succeeded");
+      void this.release(resolvesDeadlineBlock);
       return;
     }
-    if (this.phase !== "compacting" || !this.operation.managed) return;
+    const resolvesDeadlineBlock = this.phase === "blocked-unknown" && this.blockedReason === "compaction-deadline";
+    if (!this.operation.managed && this.operation.reason === "builtin" && (this.phase === "observed-preflight" || resolvesDeadlineBlock)) {
+      this.clearCompactionDeadlines();
+      this.lastOutcome = "completed";
+      if (!this.persistClaim("compacted")) {
+        this.block("claim-persist-failed", false);
+        return;
+      }
+      this.record(resolvesDeadlineBlock ? "late-builtin-compaction-success" : "builtin-compaction-succeeded");
+      void this.release(resolvesDeadlineBlock);
+      return;
+    }
+    if ((this.phase !== "compacting" && !resolvesDeadlineBlock) || !this.operation.managed) return;
     if (this.operation.managedCompleteObserved) {
       this.record("late-manual-compaction-event-ignored");
       return;
@@ -293,7 +313,9 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   }
 
   onManagedCompactionComplete(generationId: string, operationId: string): void {
-    if (!this.isCurrentGeneration(generationId) || this.phase !== "compacting" || !this.operation) return;
+    if (!this.isCurrentGeneration(generationId) || !this.operation) return;
+    const resolvesDeadlineBlock = this.phase === "blocked-unknown" && this.blockedReason === "compaction-deadline";
+    if (this.phase !== "compacting" && !resolvesDeadlineBlock) return;
     if (this.operation.id !== operationId) {
       this.record("stale-operation-callback-dropped");
       return;
@@ -314,7 +336,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       return;
     }
     if (!this.operation.resume) {
-      void this.release();
+      void this.release(resolvesDeadlineBlock);
       return;
     }
     this.phase = "resuming";
@@ -473,7 +495,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       return { disposition: "applied", action: request.action, operationId: request.operationId, generationId: this.generationId };
     }
     if (request.action === "retry-blocked-drainer") {
-      const drainer = this.releaseCut?.[this.releaseIndex];
+      const drainer = this.releaseCut?.[this.releaseIndex]?.registration;
       const retryableBlock = this.blockedReason === "drainer-deadline" || this.blockedReason === "drainer-threw" || this.blockedReason === "drainer-blocked";
       if (!retryableBlock || request.evidenceClass !== "idempotent-drainer-state" || request.consumerId === undefined || request.consumerId !== this.blockedDrainerConsumerId || drainer?.consumerId !== request.consumerId) return reject("repair-not-applicable");
       this.record("repair-applied", {
@@ -557,7 +579,17 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.blockedDrainerConsumerId = undefined;
     this.phase = "releasing";
     if (!retryBlockedDrainer) {
-      this.releaseCut = [...this.drainers.values()].sort((left, right) => left.priority - right.priority || left.consumerId.localeCompare(right.consumerId));
+      const registrations = [...this.drainers.values()].sort((left, right) => left.priority - right.priority || left.consumerId.localeCompare(right.consumerId));
+      try {
+        this.releaseCut = registrations.map((registration) => {
+          const cut = registration.capture();
+          if (!Number.isSafeInteger(cut.watermark) || cut.watermark < 0 || !Number.isSafeInteger(cut.heldCount) || cut.heldCount < 0) throw new Error("invalid release watermark");
+          return { registration, cut: Object.freeze({ ...cut }) };
+        });
+      } catch {
+        this.block("release-cut-capture-failed");
+        return;
+      }
       this.releaseIndex = 0;
     }
     if (this.releaseCut === undefined) {
@@ -567,8 +599,9 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.transition(retryBlockedDrainer ? "blocked-drainer-retry-started" : "release-started");
     const operation = this.operation;
     while (this.releaseIndex < this.releaseCut.length) {
-      const drainer = this.releaseCut[this.releaseIndex];
-      if (drainer === undefined || !this.isCurrentGeneration(drainer.generationId) || this.operation !== operation) return;
+      const captured = this.releaseCut[this.releaseIndex];
+      const drainer = captured?.registration;
+      if (captured === undefined || drainer === undefined || !this.isCurrentGeneration(drainer.generationId) || this.operation !== operation) return;
       const permit: ReleasePermit = Object.freeze({
         protocolVersion: 1,
         sessionId: this.sessionId,
@@ -576,6 +609,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         operationId: operation.id,
         releaseId: randomUUID(),
         consumerId: drainer.consumerId,
+        cut: captured.cut,
       });
       this.activePermits.add(permit);
       let pendingAck: Promise<DrainAck> | DrainAck;
@@ -601,7 +635,13 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         return;
       }
       const ack = outcome.ack;
-      if (ack.releaseId !== permit.releaseId || ack.consumerId !== permit.consumerId || ack.submittedCount < 0 || ack.disposition === "blocked") {
+      if (ack.releaseId !== permit.releaseId
+        || ack.consumerId !== permit.consumerId
+        || !Number.isSafeInteger(ack.submittedCount) || ack.submittedCount < 0
+        || !Number.isSafeInteger(ack.handledCount) || ack.handledCount !== permit.cut.heldCount
+        || ack.handledThrough !== permit.cut.watermark
+        || (ack.disposition === "empty" && permit.cut.heldCount !== 0)
+        || ack.disposition === "blocked") {
         this.blockedDrainerConsumerId = drainer.consumerId;
         this.block("drainer-blocked");
         return;

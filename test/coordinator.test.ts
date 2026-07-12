@@ -63,6 +63,20 @@ describe("managed lifecycle coordinator", () => {
     expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
   });
 
+  it("best-effort adopts native manual compaction only after its visible preflight hook", async () => {
+    const test = setup();
+    test.coordinator.onSessionBeforeCompact(test.generationId, "manual");
+    expect(test.registry.snapshot()).toMatchObject({ phase: "observed-preflight", reason: "builtin" });
+    expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
+
+    test.coordinator.onSessionCompact(test.generationId, "manual");
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+    expect(test.compact).not.toHaveBeenCalled();
+    expect(test.sendResume).not.toHaveBeenCalled();
+  });
+
   it("adopts automatic threshold compaction, holds wakes, and releases on durable success", async () => {
     const test = setup();
 
@@ -76,6 +90,24 @@ describe("managed lifecycle coordinator", () => {
 
     expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
     expect(test.sendResume).not.toHaveBeenCalled();
+  });
+
+  it("lets late durable automatic success resolve the current compaction block", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = setup();
+      test.coordinator.onSessionBeforeCompact(test.generationId, "threshold");
+      vi.advanceTimersByTime(600_000);
+      expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+
+      test.coordinator.onSessionCompact(test.generationId, "threshold");
+      await Promise.resolve();
+
+      expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+      expect(test.sendResume).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("releases automatic compaction as failed when the same generation settles without success", async () => {
@@ -135,6 +167,25 @@ describe("managed lifecycle coordinator", () => {
       expect(test.registry.snapshot().phase).toBe("blocked-unknown");
       expect(test.sendResume).not.toHaveBeenCalled();
       expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets late durable managed success plus owned completion resolve the current block", () => {
+    vi.useFakeTimers();
+    try {
+      const test = setup();
+      test.coordinator.requestSelfCompaction("", "tool");
+      test.coordinator.onAgentSettled(test.generationId);
+      vi.advanceTimersByTime(600_000);
+      expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+
+      test.coordinator.onSessionCompact(test.generationId, "manual");
+      test.compact.mock.calls[0]?.[0].onComplete();
+
+      expect(test.registry.snapshot()).toMatchObject({ phase: "resuming", lastOutcome: "completed" });
+      expect(test.sendResume).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
@@ -221,10 +272,11 @@ describe("managed lifecycle coordinator", () => {
         consumerId: "consumer",
         priority: 1,
         generationId: test.generationId,
+        capture: () => ({ watermark: 0, heldCount: 0 }),
         async drain(value) {
           permit = value;
           await waiting;
-          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0 };
+          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
         },
       });
       test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
@@ -249,6 +301,40 @@ describe("managed lifecycle coordinator", () => {
     }
   });
 
+  it("captures one finite consumer watermark cut and does not absorb a post-cut arrival", async () => {
+    const test = setup();
+    const held = [{ sequence: 1, id: "A" }];
+    let nextSequence = 1;
+    test.coordinator.registerDrainer({
+      consumerId: "consumer",
+      priority: 1,
+      generationId: test.generationId,
+      capture() {
+        return { watermark: nextSequence, heldCount: held.length };
+      },
+      drain(permit) {
+        expect(permit.cut).toEqual({ watermark: 1, heldCount: 1 });
+        held.push({ sequence: ++nextSequence, id: "B" });
+        const captured = held.filter((item) => item.sequence <= permit.cut.watermark);
+        for (const item of captured) held.splice(held.indexOf(item), 1);
+        return {
+          releaseId: permit.releaseId,
+          consumerId: permit.consumerId,
+          disposition: "submitted",
+          submittedCount: 1,
+          handledCount: captured.length,
+          handledThrough: permit.cut.watermark,
+        };
+      },
+    });
+    test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+    test.coordinator.onAgentSettled(test.generationId);
+    completeManagedCompaction(test);
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
+
+    expect(held).toEqual([{ sequence: 2, id: "B" }]);
+  });
+
   it("retries only the blocked drainer in the existing cut with a fresh permit", async () => {
     const test = setup();
     const permits: ReleasePermit[] = [];
@@ -257,6 +343,7 @@ describe("managed lifecycle coordinator", () => {
       consumerId: "consumer",
       priority: 1,
       generationId: test.generationId,
+      capture: () => ({ watermark: 0, heldCount: 0 }),
       drain(permit) {
         permits.push(permit);
         attempts += 1;
@@ -265,6 +352,8 @@ describe("managed lifecycle coordinator", () => {
           consumerId: permit.consumerId,
           disposition: attempts === 1 ? "blocked" : "empty",
           submittedCount: 0,
+          handledCount: 0,
+          handledThrough: permit.cut.watermark,
         };
       },
     });
@@ -302,10 +391,11 @@ describe("managed lifecycle coordinator", () => {
       consumerId: "consumer",
       priority: 1,
       generationId: test.generationId,
+      capture: () => ({ watermark: 0, heldCount: 0 }),
       async drain(value) {
         permit = value;
         await waiting;
-        return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0 };
+        return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
       },
     });
     test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
@@ -587,9 +677,10 @@ describe("managed lifecycle coordinator", () => {
         consumerId: "consumer",
         priority: 1,
         generationId: test.generationId,
+        capture: () => ({ watermark: 0, heldCount: 0 }),
         async drain(value) {
           await waiting;
-          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0 };
+          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
         },
       });
       test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
