@@ -46,6 +46,7 @@ describe("managed lifecycle coordinator", () => {
     expect(resume).toContain("reload HANDOFF.md");
     expect(resume).toContain(`operationId=${operationId}`);
     expect(resume).toContain(`generationId=${test.generationId}`);
+    expect(test.coordinator.requestSelfCompaction("too late to replace the admitted message", "late-tool").disposition).toBe("joined");
 
     // A handled input or unrelated run has no matching user message and cannot release.
     test.coordinator.onAgentSettled(test.generationId);
@@ -225,6 +226,32 @@ describe("managed lifecycle coordinator", () => {
     expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "failed" });
     expect(test.sendResume).not.toHaveBeenCalled();
     expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "managed-compaction-failed", outcome: "failed" }));
+  });
+
+  it("classifies authoritative managed cancellation without logging its error", async () => {
+    const test = setup();
+    test.coordinator.requestSelfCompaction("", "tool");
+    test.coordinator.onAgentSettled(test.generationId);
+
+    test.compact.mock.calls[0]?.[0].onError(new Error("Compaction cancelled"));
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "cancelled" });
+    expect(test.sendResume).not.toHaveBeenCalled();
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "managed-compaction-cancelled", outcome: "cancelled" }));
+    expect(JSON.stringify(test.coordinator.diagnostics())).not.toContain("Compaction cancelled");
+  });
+
+  it("classifies an observed automatic abort signal as cancellation", async () => {
+    const test = setup();
+    const operationId = test.coordinator.onSessionBeforeCompact(test.generationId, "threshold");
+    expect(operationId).toEqual(expect.any(String));
+
+    test.coordinator.onCompactionCancelled(test.generationId, operationId ?? "missing");
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "cancelled" });
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "automatic-compaction-cancelled", outcome: "cancelled" }));
   });
 
   it("does not send resume from a manual event until managed onComplete", () => {
@@ -769,6 +796,40 @@ describe("managed lifecycle coordinator", () => {
     expect(compact).not.toHaveBeenCalled();
     expect(sendResume).not.toHaveBeenCalled();
     expect(claims).toEqual(["cancelled", "released"]);
+  });
+
+  it("requires fresh-session recovery instead of abandoning a restored operation that had started", () => {
+    const registry = registryForHost({});
+    const coordinator = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
+    coordinator.attachPublication(publication);
+    const generationId = coordinator.bindSession("session", { compact: vi.fn(), sendResume: vi.fn() });
+    coordinator.restoreClaims([{
+      schemaVersion: 1,
+      ownerInstanceId: "old-owner",
+      originOwnerInstanceId: "old-owner",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId: "old-generation",
+      state: "compacting",
+      reason: "self",
+      resumeIntent: true,
+      timestamp: 1,
+    }]);
+    const blocked = registry.snapshot();
+
+    expect(registry.repair({
+      action: "abandon-interrupted-operation",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "branch-validated-owner-replaced",
+      actor: "operator",
+      channel: "command",
+    })).toMatchObject({ disposition: "rejected", code: "fresh-session-required" });
+    expect(registry.snapshot()).toMatchObject({ phase: "blocked-unknown", operationId: "old-operation" });
   });
 
   it("keeps a disposed generation inert when an old drainer deadline or ack arrives", async () => {

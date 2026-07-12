@@ -208,7 +208,13 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
     const binding = bindingFor(ctx);
     if (binding === undefined) return;
     binding.context = ctx;
-    coordinator?.onSessionBeforeCompact(binding.generationId, event.reason);
+    const owner = coordinator;
+    const operationId = owner?.onSessionBeforeCompact(binding.generationId, event.reason);
+    if (owner !== undefined && operationId !== undefined) {
+      const onAbort = () => { owner.onCompactionCancelled(binding.generationId, operationId); };
+      if (event.signal.aborted) onAbort();
+      else event.signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
 
   pi.on("session_compact", (event, ctx) => {

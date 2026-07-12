@@ -277,6 +277,97 @@ describe("public SDK managed tracer", () => {
     }
   });
 
+  it("classifies a public-SDK managed compaction cancellation without resume", async () => {
+    const roots = await createDisposableHarnessRoots();
+    try {
+      await withDisposableHarnessEnvironment(roots, async () => {
+        const provider = createDeferredFakeProvider();
+        const first = provider.enqueue(fauxAssistantMessage(fauxToolCall("self_compact", {}, { id: "self-compact-cancel" }), { stopReason: "toolUse" }));
+        const second = provider.enqueue(fauxAssistantMessage("Ending the requesting run before managed cancellation."));
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_000 } });
+        const providerExtension = (pi: ExtensionAPI) => {
+          pi.registerProvider(provider.provider, {
+            api: provider.api,
+            apiKey: "disposable-test-key",
+            baseUrl: "http://localhost.invalid",
+            models: provider.models.map((model) => ({
+              id: model.id,
+              name: model.name,
+              api: model.api,
+              reasoning: model.reasoning,
+              input: model.input,
+              cost: model.cost,
+              contextWindow: model.contextWindow,
+              maxTokens: model.maxTokens,
+            })),
+            streamSimple: (model, context, options) => provider.streamSimple(model, context, options),
+          });
+        };
+        const cancellationExtension = (pi: ExtensionAPI) => {
+          pi.on("session_before_compact", () => ({ cancel: true }));
+        };
+        const loader = new DefaultResourceLoader({ cwd: roots.cwd, agentDir: roots.agentDir, settingsManager, extensionFactories: [providerExtension, contextLifecycleExtension, cancellationExtension] });
+        await loader.reload();
+        const sessionManager = SessionManager.create(roots.cwd, roots.sessions);
+        for (let index = 0; index < 5; index += 1) {
+          sessionManager.appendMessage({ role: "user", content: `cancel-history-${index} ${"u".repeat(4_000)}`, timestamp: Date.now() });
+          sessionManager.appendMessage(fauxAssistantMessage(`cancel-response-${index} ${"a".repeat(4_000)}`));
+        }
+        const { session } = await createAgentSession({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          sessionManager,
+          model: provider.getModel(),
+          tools: ["self_compact"],
+        });
+        await session.bindExtensions({ mode: "print" });
+        let compactionStarts = 0;
+        let abortedEnds = 0;
+        let resumeStarts = 0;
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "compaction_start") compactionStarts += 1;
+          if (event.type === "compaction_end" && event.aborted) abortedEnds += 1;
+          if (event.type === "message_start" && event.message.role === "user" && textContent(event.message.content)?.includes("pi-context-lifecycle:v1 resume") === true) resumeStarts += 1;
+        });
+        const wait = async (promise: Promise<unknown>, label: string): Promise<void> => {
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            await Promise.race([promise, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 5_000); })]);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+        };
+        try {
+          const prompt = session.prompt("Run managed self compaction and exercise cancellation.");
+          await wait(first.call, "initial cancellation provider call");
+          first.release();
+          await wait(second.call, "post-tool cancellation provider call");
+          second.release();
+          await wait(prompt, "cancellation prompt settlement");
+          await vi.waitFor(() => expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "cancelled" }), { timeout: 5_000 });
+
+          expect(compactionStarts).toBe(1);
+          expect(abortedEnds).toBe(1);
+          expect(resumeStarts).toBe(0);
+          expect(provider.callCount).toBe(2);
+          expect(sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+          expect(getContextLifecycleDiagnosticsV1()).toContainEqual(expect.objectContaining({ code: "managed-compaction-cancelled", outcome: "cancelled" }));
+        } finally {
+          unsubscribe();
+          session.dispose();
+        }
+      });
+    } finally {
+      await roots.cleanup();
+    }
+  });
+
   it("adopts native automatic threshold compaction and returns to idle without self resume", async () => {
     const roots = await createDisposableHarnessRoots();
     try {

@@ -133,12 +133,27 @@ describe("Pi extension tracer", () => {
     contextLifecycleExtension(test.api);
     test.emit("session_start", { type: "session_start", reason: "startup" });
 
-    test.emit("session_before_compact", { type: "session_before_compact", reason: "threshold", willRetry: false });
+    test.emit("session_before_compact", { type: "session_before_compact", reason: "threshold", willRetry: false, signal: new AbortController().signal });
     expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "observed-preflight", reason: "threshold" });
 
     test.emit("session_compact", { type: "session_compact", reason: "threshold", fromExtension: false, willRetry: false });
     expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
     expect(test.compact).not.toHaveBeenCalled();
+    expect(test.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("classifies an automatic compaction abort signal as cancelled", async () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+    const cancellation = new AbortController();
+
+    test.emit("session_before_compact", { type: "session_before_compact", reason: "overflow", willRetry: true, signal: cancellation.signal });
+    expect(getContextLifecycleSnapshotV1().phase).toBe("observed-preflight");
+    cancellation.abort();
+    await Promise.resolve();
+
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "cancelled" });
     expect(test.sendUserMessage).not.toHaveBeenCalled();
   });
 

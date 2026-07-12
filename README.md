@@ -24,10 +24,10 @@ Native manual `/compact` is an unmanaged escape hatch. The coordinator adopts it
 2. The coordinator closes managed wake admission and waits for the requesting agent run to settle.
 3. It invokes `ctx.compact()` once. Successful managed completion requires exactly one matching durable manual `session_compact` event plus the operation-owned `onComplete` callback.
 4. A successful self operation persists `resume-pending` and `resume-admitting`, sends one operation/generation-marked resume, and waits for the exact user `message_start` plus its `agent_settled` barrier.
-5. Release captures one finite per-consumer watermark/count cut. Drainers run sequentially by priority under opaque, generation-bound permits and must acknowledge the exact handled watermark/count within five seconds.
+5. Release captures one finite per-consumer/per-lane watermark/count cut. Drainers run under opaque, generation-bound permits in the exported order `failure-attention-decision`, `mesh-reply`, `mesh-unsolicited`, `subagent-success`, `background-notify`, `loop-tick`, then `cron-tick`. A consumer may own multiple lanes, and each acknowledgement must match the exact consumer, lane, handled watermark, and count within five seconds.
 6. The operation returns to idle only after every captured lane is empty, submitted/durably represented, or an explicit block is recorded.
 
-Managed `onError` releases the unchanged session without a resume. Automatic threshold/overflow success is authoritative only from `session_compact`; same-generation `agent_settled` after an observed automatic preflight and no success event proves the enclosing attempt stopped without success. Public-SDK tests cover automatic threshold success and managed provider-failure ordering.
+Managed `onError` releases the unchanged session without a resume and distinguishes cancellation errors from provider failure. An observed compaction abort signal is authoritative cancellation evidence for managed or automatic work. Automatic threshold/overflow success is authoritative only from `session_compact`; same-generation `agent_settled` after an observed automatic preflight and no success/abort event proves the enclosing attempt stopped without success. Public-SDK tests cover automatic threshold success, managed provider-failure ordering, and managed hook cancellation.
 
 Observation deadlines warn after two minutes and block after ten minutes for compaction, warn after 30 seconds and block after 60 seconds for resume admission, and block one drainer after five seconds. Deadlines never unlock, resend, or fabricate success. Late current-operation terminal evidence can still resolve a compaction block.
 
@@ -36,6 +36,7 @@ Observation deadlines warn after two minutes and block after ten minutes for com
 ```ts
 import {
   admitWake,
+  CONTEXT_LIFECYCLE_RELEASE_LANES,
   getContextLifecycleSnapshotV1,
   observeContextLifecycleV1,
   registerContextLifecycleDrainerV1,
@@ -46,7 +47,7 @@ import {
 
 Helpers share one structural registry at `Symbol.for("yourdigitaltoolbox.pi-context-lifecycle.v1")`, even when independently resolved package copies are loaded. Publication uses compare-and-swap ownership; observation atomically subscribes and returns the current sequenced snapshot; compaction and wake admission require the current session generation.
 
-Held bodies never enter the coordinator. A drainer captures only `{ watermark, heldCount }`; its permit carries that frozen cut, and its acknowledgement must prove `handledThrough` and `handledCount`. Copying permit fields does not copy its object-identity authority.
+Held bodies never enter the coordinator. A drainer registers one exported `laneId` and captures only `{ watermark, heldCount }`; its permit carries that frozen cut, and its acknowledgement must prove lane, `handledThrough`, and `handledCount`. The registration key is consumer plus lane, so one consumer can own several accepted lanes without magic priorities. Copying permit fields does not copy its object-identity authority.
 
 Managed profiles treat unavailable or incompatible authority as a visible fail-closed configuration error.
 
@@ -59,7 +60,7 @@ requested → compacting → compacted → resume-pending → resume-admitting
 → resume-admitted → resume-settled → released
 ```
 
-Terminal alternatives include `failed`, `cancelled`, and `blocked-unknown`. Entries contain owner, session, generation, operation, reason, state, and timestamp only—never prompts, focus text, summaries, tool output, credentials, or mesh bodies.
+Terminal alternatives include `failed`, `cancelled`, and `blocked-unknown`. Entries contain owner, session, generation, operation, reason, boolean resume intent, state, and timestamp only—never prompts, focus text, summaries, tool output, credentials, or mesh bodies. An intent-changing join appends a new claim at the current durable state so owner replacement preserves resume intent while discarding sensitive focus text.
 
 A replacement owner restores every nonterminal old-owner claim as blocked under a fresh generation. `/context-lifecycle status` exposes the redacted snapshot and bounded diagnostics. `/context-lifecycle repair <exact-json-request>` applies only an exact operation/session/generation/phase/snapshot-sequence compare-and-swap and supports:
 
@@ -67,9 +68,9 @@ A replacement owner restores every nonterminal old-owner claim as blocked under 
 - retrying a restored `resume-pending` claim before any admission attempt;
 - abandoning a restored ambiguous `resume-admitting` claim without resend after owner replacement;
 - retrying the existing idempotent blocked drainer cut with a fresh opaque permit;
-- abandoning a restored never-started operation after branch-validated owner replacement.
+- abandoning a restored never-started `requested` operation after branch-validated owner replacement.
 
-Caller assertion alone does not establish current-process quiescence. Persisted resume recognition additionally passes through the extension's session-entry verifier. Ambiguous current-owner admission never automatically resends.
+Restored `compacting`, `compacted`, or otherwise interrupted nonterminal states are not silently abandoned by that action; they return `fresh-session-required`. Caller assertion alone does not establish current-process quiescence. Persisted resume recognition additionally passes through the extension's session-entry verifier. Ambiguous current-owner admission never automatically resends.
 
 ## Fresh-session handoff
 
@@ -90,7 +91,7 @@ The command calls `newSession({ parentSession, withSession })` once and uses onl
 
 The manifest validator requires full commit/tree identities, SHA-256 archive/lock digests, exact Pi version/integrity, a deterministic scenario seed, relative archive paths, and a complete unique package order. Candidate-specific values and outputs remain outside lifecycle source so they cannot create a self-referential commit identity.
 
-The real-session suite uses public Pi SDK/session APIs and disposable roots. It currently proves the managed success path, provider failure, automatic threshold compaction, successful-response overflow compaction, exact resume admission, rejected handled/transformed/unrelated resume paths, and command-context handoff routing. Final four-package consumer races and the 100-cycle exact-candidate soak are completed after consumer adapters are pinned in later Build slices.
+The real-session suite uses public Pi SDK/session APIs and disposable roots. It currently proves the managed success path, provider failure, managed cancellation, automatic threshold compaction, successful-response overflow compaction, exact resume admission, rejected handled/transformed/unrelated resume paths, and command-context handoff routing. Final four-package consumer races and the 100-cycle exact-candidate soak are completed after consumer adapters are pinned in later Build slices.
 
 ## Development
 

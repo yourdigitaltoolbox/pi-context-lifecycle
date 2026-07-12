@@ -39,6 +39,11 @@ function isLifecycleLane(value: unknown): value is LifecycleLane {
   return typeof value === "string" && (CONTEXT_LIFECYCLE_RELEASE_LANES as readonly string[]).includes(value);
 }
 
+function isCancellationError(error: Error): boolean {
+  const code = (error as Error & { code?: unknown }).code;
+  return error.name === "AbortError" || code === "ABORT_ERR" || /\b(?:abort(?:ed)?|cancelled|canceled)\b/i.test(error.message);
+}
+
 export interface ManagedCompactionAdapter {
   compact(options: { customInstructions: string; onComplete(): void; onError(error: Error): void }): void;
   sendResume(message: string): void;
@@ -207,7 +212,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       const addsResumeIntent = !this.operation.resume && (request.resume === true || request.reason === "self");
       if (request.resume === true || request.reason === "self") {
         this.operation.resume = true;
-        this.operation.resumeMessage = markedResumeMessage(content.resumeMessage, this.operation.id, this.generationId);
+        if (this.phase !== "resuming") this.operation.resumeMessage = markedResumeMessage(content.resumeMessage, this.operation.id, this.generationId);
         if (!this.operation.compactStarted) this.operation.customInstructions = content.customInstructions;
       }
       if (addsResumeIntent && !this.persistClaim(this.operation.claimState)) {
@@ -268,15 +273,15 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     }
   }
 
-  onSessionBeforeCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
-    if (!this.isCurrentGeneration(generationId)) return;
+  onSessionBeforeCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): string | undefined {
+    if (!this.isCurrentGeneration(generationId)) return undefined;
     if (reason === "manual" && this.phase === "compacting" && this.operation?.managed) {
       this.record("managed-compaction-preflight-observed");
-      return;
+      return this.operation.id;
     }
     if (this.phase !== "idle" || this.operation !== undefined) {
       this.block(reason === "manual" ? "builtin-compaction-overlapped-active-operation" : "automatic-compaction-overlapped-active-operation");
-      return;
+      return undefined;
     }
     const observedReason: CompactionReason = reason === "manual" ? "builtin" : reason;
     this.operation = {
@@ -297,10 +302,24 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.phase = "observed-preflight";
     if (!this.persistClaim("compacting")) {
       this.block("claim-persist-failed", false);
-      return;
+      return undefined;
     }
     this.transition(reason === "manual" ? "builtin-compaction-preflight-observed" : "automatic-compaction-preflight-observed");
     this.scheduleCompactionDeadlines(this.operation.id);
+    return this.operation.id;
+  }
+
+  onCompactionCancelled(generationId: string, operationId: string): void {
+    if (!this.isCurrentGeneration(generationId) || !this.operation || this.operation.id !== operationId) return;
+    if (this.phase !== "observed-preflight" && this.phase !== "compacting") return;
+    this.clearCompactionDeadlines();
+    this.lastOutcome = "cancelled";
+    if (!this.persistClaim("cancelled")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
+    this.record(this.operation.managed ? "managed-compaction-cancelled" : "automatic-compaction-cancelled");
+    void this.release();
   }
 
   onSessionCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
@@ -381,7 +400,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.record("resume-sent");
   }
 
-  onManagedCompactionError(generationId: string, operationId: string): void {
+  onManagedCompactionError(generationId: string, operationId: string, error: Error): void {
     if (!this.isCurrentGeneration(generationId) || !this.operation) return;
     const resolvesDeadlineBlock = this.phase === "blocked-unknown" && this.blockedReason === "compaction-deadline";
     if (this.phase !== "compacting" && !resolvesDeadlineBlock) return;
@@ -394,12 +413,15 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       return;
     }
     this.clearCompactionDeadlines();
-    this.lastOutcome = "failed";
-    if (!this.persistClaim("failed")) {
+    const cancelled = isCancellationError(error);
+    this.lastOutcome = cancelled ? "cancelled" : "failed";
+    if (!this.persistClaim(cancelled ? "cancelled" : "failed")) {
       this.block("claim-persist-failed", false);
       return;
     }
-    this.record(resolvesDeadlineBlock ? "late-managed-compaction-failure" : "managed-compaction-failed");
+    this.record(cancelled
+      ? (resolvesDeadlineBlock ? "late-managed-compaction-cancellation" : "managed-compaction-cancelled")
+      : (resolvesDeadlineBlock ? "late-managed-compaction-failure" : "managed-compaction-failed"));
     void this.release(resolvesDeadlineBlock);
   }
 
@@ -602,8 +624,8 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       onComplete: () => {
         if (generation !== undefined) this.onManagedCompactionComplete(generation, operationId);
       },
-      onError: () => {
-        if (generation !== undefined) this.onManagedCompactionError(generation, operationId);
+      onError: (error) => {
+        if (generation !== undefined) this.onManagedCompactionError(generation, operationId, error);
       },
     });
   }
