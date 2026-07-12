@@ -7,7 +7,7 @@ import { CONTEXT_LIFECYCLE_REGISTRY_SYMBOL } from "../src/types.js";
 
 interface RegisteredToolLike {
   name: string;
-  execute(toolCallId: string, params: { instructions?: string; handoffPath?: string; nextStep?: string }): Promise<{ content: Array<{ type: string; text: string }> }>;
+  execute(toolCallId: string, params: { instructions?: string; handoffPath?: string; nextStep?: string }, signal: AbortSignal | undefined, onUpdate: undefined, context: ExtensionContext): Promise<{ content: Array<{ type: string; text: string }> }>;
 }
 interface RegisteredCommandLike {
   handler(args: string, context: ExtensionCommandContext): Promise<void>;
@@ -60,7 +60,7 @@ describe("Pi extension tracer", () => {
     test.emit("session_start", { type: "session_start", reason: "startup" });
     const tool = test.getTool();
     expect(tool).toBeDefined();
-    const result = await tool?.execute("tool-call", { instructions: "reload durable state" });
+    const result = await tool?.execute("tool-call", { instructions: "reload durable state" }, undefined, undefined, test.context);
     expect(result?.content[0]?.text).toContain("accepted");
     expect(test.compact).not.toHaveBeenCalled();
 
@@ -148,7 +148,7 @@ describe("Pi extension tracer", () => {
 
     const tool = test.getTool("handoff_new_session");
     expect(tool).toBeDefined();
-    const result = await tool?.execute("handoff-tool", { handoffPath: "HANDOFF.md", nextStep: "Run the next test." });
+    const result = await tool?.execute("handoff-tool", { handoffPath: "HANDOFF.md", nextStep: "Run the next test." }, undefined, undefined, test.context);
     expect(test.sendUserMessage).not.toHaveBeenCalled();
     expect(result?.content[0]?.text).toContain("/handoff-new-session");
     expect(result?.content[0]?.text).toContain("HANDOFF.md");
@@ -219,34 +219,35 @@ describe("Pi extension tracer", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("applied"), "info");
   });
 
-  it("rebinds a replacement session and keeps old-session callbacks and contexts inert", async () => {
+  it("fences old callbacks and contexts across a same-session-id reload", async () => {
     const test = harness();
     contextLifecycleExtension(test.api);
     test.emit("session_start", { type: "session_start", reason: "startup" });
     const oldGeneration = getContextLifecycleSnapshotV1().generationId;
-    await test.getTool()?.execute("old-tool", {});
+    await test.getTool()?.execute("old-tool", {}, undefined, undefined, test.context);
     test.emit("agent_settled", { type: "agent_settled" });
     expect(test.compact).toHaveBeenCalledTimes(1);
     const oldComplete = () => test.compact.mock.calls[0]?.[0].onComplete();
 
-    test.emit("session_shutdown", { type: "session_shutdown", reason: "new" });
     const newCompact = vi.fn<ManagedCompactionAdapter["compact"]>();
     const newContext = {
-      sessionManager: { getSessionId: () => "replacement-session", getEntries: () => [] },
+      sessionManager: { getSessionId: () => "session", getEntries: () => [] },
       compact: newCompact,
       getContextUsage: () => undefined,
     } as unknown as ExtensionContext;
-    test.emit("session_start", { type: "session_start", reason: "new" }, newContext);
+    test.emit("session_start", { type: "session_start", reason: "reload" }, newContext);
     const replacement = getContextLifecycleSnapshotV1();
-    expect(replacement).toMatchObject({ registryState: "ready", sessionId: "replacement-session", phase: "idle" });
+    expect(replacement).toMatchObject({ registryState: "ready", sessionId: "session", phase: "idle" });
     expect(replacement.generationId).not.toBe(oldGeneration);
 
     oldComplete();
     test.emit("agent_settled", { type: "agent_settled" }, test.context);
-    expect(getContextLifecycleSnapshotV1()).toMatchObject({ sessionId: "replacement-session", phase: "idle" });
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ sessionId: "session", generationId: replacement.generationId, phase: "idle" });
     expect(newCompact).not.toHaveBeenCalled();
 
-    await test.getTool()?.execute("new-tool", {});
+    const staleTool = await test.getTool()?.execute("stale-tool", {}, undefined, undefined, test.context);
+    expect(staleTool?.content[0]?.text).toContain("rejected (session-unavailable)");
+    await test.getTool()?.execute("new-tool", {}, undefined, undefined, newContext);
     test.emit("agent_settled", { type: "agent_settled" }, newContext);
     expect(newCompact).toHaveBeenCalledTimes(1);
   });
@@ -255,7 +256,7 @@ describe("Pi extension tracer", () => {
     const test = harness();
     contextLifecycleExtension(test.api);
     test.emit("session_start", { type: "session_start", reason: "startup" });
-    await test.getTool()?.execute("tool-call", { instructions: "sensitive focus must not persist" });
+    await test.getTool()?.execute("tool-call", { instructions: "sensitive focus must not persist" }, undefined, undefined, test.context);
     test.emit("agent_settled", { type: "agent_settled" });
     test.emit("session_compact", { type: "session_compact", reason: "manual", fromExtension: false });
     test.compact.mock.calls[0]?.[0].onComplete();
@@ -284,7 +285,7 @@ describe("Pi extension tracer", () => {
     const test = harness();
     contextLifecycleExtension(test.api);
     test.emit("session_start", { type: "session_start", reason: "startup" });
-    await test.getTool()?.execute("tool-call", {});
+    await test.getTool()?.execute("tool-call", {}, undefined, undefined, test.context);
     test.emit("agent_settled", { type: "agent_settled" });
     test.emit("session_compact", { type: "session_compact", reason: "threshold", fromExtension: false });
     test.compact.mock.calls[0]?.[0].onComplete();

@@ -132,6 +132,7 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
   interface SessionBinding {
     sessionId: string;
     generationId: string;
+    sessionManager: ExtensionContext["sessionManager"];
     context: ExtensionContext;
   }
 
@@ -144,7 +145,7 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
 
   const bindingFor = (ctx: ExtensionContext): SessionBinding | undefined => {
     const binding = activeBinding;
-    return binding !== undefined && ctx.sessionManager.getSessionId() === binding.sessionId ? binding : undefined;
+    return binding !== undefined && ctx.sessionManager === binding.sessionManager && ctx.sessionManager.getSessionId() === binding.sessionId ? binding : undefined;
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -152,7 +153,7 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
     const next = new ContextLifecycleCoordinatorV1();
     const publication = publishContextLifecycleV1(next.ownerInstanceId, next, {});
     next.attachPublication(publication);
-    const binding = { sessionId: ctx.sessionManager.getSessionId(), generationId: "", context: ctx };
+    const binding = { sessionId: ctx.sessionManager.getSessionId(), generationId: "", sessionManager: ctx.sessionManager, context: ctx };
     const adapter: ManagedCompactionAdapter = {
       compact(options) {
         binding.context.compact(options);
@@ -312,8 +313,12 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
     parameters: Type.Object({
       instructions: Type.Optional(Type.String({ description: "Optional focus for what the compaction summary and resumed turn should preserve and reload." })),
     }),
-    execute(toolCallId, params) {
-      const disposition = coordinator?.requestSelfCompaction(params.instructions ?? "", toolCallId) ?? { disposition: "rejected" as const, code: "session-unavailable" };
+    execute(toolCallId, params, _signal, _onUpdate, ctx) {
+      const binding = bindingFor(ctx);
+      if (binding !== undefined) binding.context = ctx;
+      const disposition = binding === undefined
+        ? { disposition: "rejected" as const, code: "session-unavailable" }
+        : coordinator?.requestSelfCompaction(params.instructions ?? "", toolCallId) ?? { disposition: "rejected" as const, code: "session-unavailable" };
       if (disposition.disposition === "rejected") return Promise.resolve(textToolResult(`Self compact rejected (${disposition.code}); no compaction was started.`));
       if (disposition.disposition === "joined") return Promise.resolve(textToolResult(`Self compact request joined managed operation ${disposition.operationId}; compaction will start after this run settles.`));
       return Promise.resolve(textToolResult(`Self compact accepted as managed operation ${disposition.operationId}; compaction will start after this tool result and agent run settle.`));
