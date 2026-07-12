@@ -1,0 +1,26 @@
+export {
+  admitWake,
+  getContextLifecycleDiagnosticsV1,
+  getContextLifecycleSnapshotV1,
+  observeContextLifecycleV1,
+  registerContextLifecycleDrainerV1,
+  requestCompaction,
+} from "./registry.js";
+export {
+  CONTEXT_LIFECYCLE_PROTOCOL_VERSION,
+  CONTEXT_LIFECYCLE_REGISTRY_SYMBOL,
+  type CompactDisposition,
+  type CompactRequest,
+  type ContextLifecycleV1,
+  type DiagnosticRecord,
+  type DrainAck,
+  type DrainerRegistration,
+  type LifecycleEvent,
+  type OperationOutcome,
+  type Phase,
+  type RegistryState,
+  type ReleasePermit,
+  type Snapshot,
+  type WakeAdmission,
+  type WakeDisposition,
+} from "./types.js";
