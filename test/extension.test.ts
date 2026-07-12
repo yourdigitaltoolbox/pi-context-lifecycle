@@ -72,6 +72,20 @@ describe("Pi extension tracer", () => {
     expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("observes automatic threshold preflight and releases after durable success", () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+
+    test.emit("session_before_compact", { type: "session_before_compact", reason: "threshold", willRetry: false });
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "observed-preflight", reason: "threshold" });
+
+    test.emit("session_compact", { type: "session_compact", reason: "threshold", fromExtension: false, willRetry: false });
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+    expect(test.compact).not.toHaveBeenCalled();
+    expect(test.sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("does not attribute a threshold event to the managed compact call", async () => {
     const test = harness();
     contextLifecycleExtension(test.api);

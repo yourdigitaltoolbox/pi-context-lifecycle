@@ -8,6 +8,7 @@ function publisher(): CoordinatorPublisherV1 {
     requestCompaction: () => ({ disposition: "rejected", code: "unused" }),
     admitWake: () => ({ disposition: "deliver", code: "unused" }),
     registerDrainer: () => () => {},
+    repair: () => ({ disposition: "rejected", code: "unused" }),
     diagnostics: () => [],
   };
 }

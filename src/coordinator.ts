@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type {
   CompactDisposition,
   CompactRequest,
+  CompactionReason,
   CoordinatorPublisherV1,
   DiagnosticRecord,
   DrainAck,
@@ -9,6 +10,8 @@ import type {
   OperationOutcome,
   Phase,
   ReleasePermit,
+  RepairDisposition,
+  RepairRequest,
   Snapshot,
   WakeAdmission,
   WakeDisposition,
@@ -24,7 +27,8 @@ export interface ManagedCompactionAdapter {
 
 interface ActiveOperation {
   id: string;
-  reason: "self" | "remote";
+  reason: CompactionReason;
+  managed: boolean;
   startedAt: number;
   resume: boolean;
   customInstructions: string;
@@ -82,6 +86,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private phase: Phase | undefined;
   private operation: ActiveOperation | undefined;
   private lastOutcome: OperationOutcome | undefined;
+  private blockedReason: string | undefined;
   private adapter: ManagedCompactionAdapter | undefined;
   private disposed = false;
   private diagnosticSequence = 0;
@@ -139,6 +144,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.operation = {
       id: operationId,
       reason: request.reason,
+      managed: true,
       startedAt: Date.now(),
       resume: request.resume === true || request.reason === "self",
       customInstructions: content.customInstructions,
@@ -159,15 +165,55 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       this.startCompaction();
       return;
     }
+    if (this.phase === "observed-preflight" && !this.operation.managed) {
+      this.lastOutcome = "failed";
+      this.record("automatic-compaction-failed");
+      void this.release();
+      return;
+    }
     if (this.phase === "resuming" && this.operation.resumeMessageMatched) void this.release();
   }
 
-  onSessionCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
-    if (!this.isCurrentGeneration(generationId) || this.phase !== "compacting" || !this.operation) return;
-    if (reason !== "manual") {
-      this.record("non-managed-compaction-event-ignored");
+  onSessionBeforeCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
+    if (!this.isCurrentGeneration(generationId)) return;
+    if (reason === "manual") {
+      if (this.phase === "compacting" && this.operation?.managed) this.record("managed-compaction-preflight-observed");
       return;
     }
+    if (this.phase !== "idle" || this.operation !== undefined) {
+      this.block("automatic-compaction-overlapped-active-operation");
+      return;
+    }
+    this.operation = {
+      id: randomUUID(),
+      reason,
+      managed: false,
+      startedAt: Date.now(),
+      resume: false,
+      customInstructions: "",
+      resumeMessage: "",
+      compactStarted: false,
+      matchingManagedSuccessEvents: 0,
+      managedCompleteObserved: false,
+      resumeMessageMatched: false,
+    };
+    this.phase = "observed-preflight";
+    this.transition("automatic-compaction-preflight-observed");
+  }
+
+  onSessionCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
+    if (!this.isCurrentGeneration(generationId) || !this.operation) return;
+    if (reason !== "manual") {
+      if (this.operation.managed || this.operation.reason !== reason || this.phase !== "observed-preflight") {
+        this.block("automatic-compaction-event-mismatch");
+        return;
+      }
+      this.lastOutcome = "completed";
+      this.record("automatic-compaction-succeeded");
+      void this.release();
+      return;
+    }
+    if (this.phase !== "compacting" || !this.operation.managed) return;
     if (this.operation.managedCompleteObserved) {
       this.record("late-manual-compaction-event-ignored");
       return;
@@ -203,11 +249,36 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.record("resume-sent");
   }
 
+  onManagedCompactionError(generationId: string, operationId: string): void {
+    if (!this.isCurrentGeneration(generationId) || this.phase !== "compacting" || !this.operation) return;
+    if (this.operation.id !== operationId) {
+      this.record("stale-operation-callback-dropped");
+      return;
+    }
+    if (this.operation.matchingManagedSuccessEvents !== 0) {
+      this.block("managed-error-after-success-event");
+      return;
+    }
+    this.lastOutcome = "failed";
+    this.record("managed-compaction-failed");
+    void this.release();
+  }
+
   onMessageStart(generationId: string, message: { role: string; content?: unknown }): void {
     if (!this.isCurrentGeneration(generationId) || this.phase !== "resuming" || !this.operation) return;
     if (message.role !== "user" || exactTextContent(message.content) !== this.operation.resumeMessage) return;
     this.operation.resumeMessageMatched = true;
     this.record("resume-message-matched");
+  }
+
+  onResumeAdmissionDeadline(generationId: string, operationId: string): void {
+    if (!this.isCurrentGeneration(generationId) || !this.operation) return;
+    if (this.operation.id !== operationId) {
+      this.record("stale-operation-deadline-dropped");
+      return;
+    }
+    if (this.phase !== "resuming" || this.operation.resumeMessageMatched) return;
+    this.block("resume-admission-deadline");
   }
 
   admitWake(request: WakeAdmission, permit?: ReleasePermit): WakeDisposition {
@@ -234,6 +305,29 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       registered = false;
       if (this.drainers.get(registration.consumerId)?.token === stored.token) this.drainers.delete(registration.consumerId);
     };
+  }
+
+  repair(request: RepairRequest): RepairDisposition {
+    const reject = (code: string): RepairDisposition => ({ disposition: "rejected", code, ...(this.generationId === undefined ? {} : { generationId: this.generationId }) });
+    if (this.disposed || !this.sessionId || !this.generationId || !this.operation || !this.phase) return reject("session-unavailable");
+    if (request.sessionId !== this.sessionId) return reject("session-mismatch");
+    if (request.generationId !== this.generationId) return reject("generation-mismatch");
+    if (request.operationId !== this.operation.id) return reject("operation-mismatch");
+    if (request.expectedPhase !== this.phase) return reject("phase-mismatch");
+    if (request.action !== "abandon-ambiguous-resume" || request.evidenceClass !== "current-process-quiescent") return reject("repair-evidence-insufficient");
+    if (this.blockedReason !== "resume-admission-deadline" || !this.operation.resume || this.operation.resumeMessageMatched || this.lastOutcome !== "completed") return reject("repair-not-applicable");
+
+    this.record("repair-applied", {
+      action: request.action,
+      evidenceClass: request.evidenceClass,
+      actor: request.actor,
+      channel: request.channel,
+      priorPhase: "blocked-unknown",
+      newPhase: "releasing",
+    });
+    this.operation.resume = false;
+    void this.release(true);
+    return { disposition: "applied", action: request.action, operationId: request.operationId, generationId: this.generationId };
   }
 
   diagnostics(): readonly DiagnosticRecord[] {
@@ -265,13 +359,14 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         if (generation !== undefined) this.onManagedCompactionComplete(generation, operationId);
       },
       onError: () => {
-        if (generation === this.generationId) this.record("compaction-error-observed");
+        if (generation !== undefined) this.onManagedCompactionError(generation, operationId);
       },
     });
   }
 
-  private async release(): Promise<void> {
-    if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting")) return;
+  private async release(fromBlockedRepair = false): Promise<void> {
+    if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting" && this.phase !== "observed-preflight" && !(fromBlockedRepair && this.phase === "blocked-unknown"))) return;
+    this.blockedReason = undefined;
     this.phase = "releasing";
     this.transition("release-started");
     const operation = this.operation;
@@ -292,14 +387,12 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         ack = await drainer.drain(permit);
       } catch {
         this.activePermits.delete(permit);
-        this.phase = "blocked-unknown";
-        this.transition("drainer-threw");
+        this.block("drainer-threw");
         return;
       }
       this.activePermits.delete(permit);
       if (ack.releaseId !== permit.releaseId || ack.consumerId !== permit.consumerId || ack.submittedCount < 0 || ack.disposition === "blocked") {
-        this.phase = "blocked-unknown";
-        this.transition("drainer-blocked");
+        this.block("drainer-blocked");
         return;
       }
     }
@@ -311,6 +404,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
 
   private block(code: string): void {
     if (this.phase === "blocked-unknown") return;
+    this.blockedReason = code;
     this.phase = "blocked-unknown";
     this.transition(code);
   }
@@ -336,7 +430,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.record(code);
   }
 
-  private record(code: string): void {
+  private record(code: string, details: Partial<Pick<DiagnosticRecord, "action" | "evidenceClass" | "actor" | "channel" | "priorPhase" | "newPhase">> = {}): void {
     const record: DiagnosticRecord = {
       protocolVersion: 1,
       sequence: ++this.diagnosticSequence,
@@ -348,6 +442,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       ...(this.operation === undefined ? {} : { operationId: this.operation.id }),
       ...(this.phase === undefined ? {} : { phase: this.phase }),
       ...(this.lastOutcome === undefined ? {} : { outcome: this.lastOutcome }),
+      ...details,
     };
     this.records.push(record);
     if (this.records.length > MAX_DIAGNOSTICS) this.records.splice(0, this.records.length - MAX_DIAGNOSTICS);

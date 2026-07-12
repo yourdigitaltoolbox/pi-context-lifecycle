@@ -4,6 +4,7 @@ export {
   getContextLifecycleSnapshotV1,
   observeContextLifecycleV1,
   registerContextLifecycleDrainerV1,
+  repairContextLifecycleV1,
   requestCompaction,
 } from "./registry.js";
 export {
@@ -20,6 +21,12 @@ export {
   type Phase,
   type RegistryState,
   type ReleasePermit,
+  type RepairAction,
+  type RepairActor,
+  type RepairChannel,
+  type RepairDisposition,
+  type RepairEvidenceClass,
+  type RepairRequest,
   type Snapshot,
   type WakeAdmission,
   type WakeDisposition,

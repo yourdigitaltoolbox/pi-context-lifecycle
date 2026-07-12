@@ -83,6 +83,27 @@ export interface DrainerRegistration {
   drain(permit: ReleasePermit): Promise<DrainAck> | DrainAck;
 }
 
+export type RepairAction = "abandon-ambiguous-resume";
+export type RepairEvidenceClass = "current-process-quiescent";
+export type RepairActor = "operator";
+export type RepairChannel = "command" | "remote";
+
+export interface RepairRequest {
+  action: RepairAction;
+  operationId: string;
+  sessionId: string;
+  generationId: string;
+  expectedPhase: "blocked-unknown";
+  expectedSequence: number;
+  evidenceClass: RepairEvidenceClass;
+  actor: RepairActor;
+  channel: RepairChannel;
+}
+
+export type RepairDisposition =
+  | { disposition: "applied"; action: RepairAction; operationId: string; generationId: string }
+  | { disposition: "rejected"; code: string; generationId?: string; sequence?: number };
+
 export interface DiagnosticRecord {
   protocolVersion: 1;
   sequence: number;
@@ -94,8 +115,14 @@ export interface DiagnosticRecord {
   operationId?: string;
   consumerId?: string;
   phase?: Phase;
+  priorPhase?: Phase;
+  newPhase?: Phase;
   outcome?: OperationOutcome;
   count?: number;
+  action?: RepairAction;
+  evidenceClass?: RepairEvidenceClass;
+  actor?: RepairActor;
+  channel?: RepairChannel;
 }
 
 export interface ContextLifecycleV1 {
@@ -104,6 +131,7 @@ export interface ContextLifecycleV1 {
   requestCompaction(request: CompactRequest): CompactDisposition;
   admitWake(request: WakeAdmission, permit?: ReleasePermit): WakeDisposition;
   registerDrainer(registration: DrainerRegistration): () => void;
+  repair(request: RepairRequest): RepairDisposition;
   diagnostics(): readonly DiagnosticRecord[];
 }
 
@@ -112,5 +140,6 @@ export interface CoordinatorPublisherV1 {
   requestCompaction(request: CompactRequest): CompactDisposition;
   admitWake(request: WakeAdmission, permit?: ReleasePermit): WakeDisposition;
   registerDrainer(registration: DrainerRegistration): () => void;
+  repair(request: RepairRequest): RepairDisposition;
   diagnostics(): readonly DiagnosticRecord[];
 }

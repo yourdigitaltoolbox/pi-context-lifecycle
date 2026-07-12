@@ -63,6 +63,33 @@ describe("managed lifecycle coordinator", () => {
     expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
   });
 
+  it("adopts automatic threshold compaction, holds wakes, and releases on durable success", async () => {
+    const test = setup();
+
+    test.coordinator.onSessionBeforeCompact(test.generationId, "threshold");
+    expect(test.registry.snapshot()).toMatchObject({ phase: "observed-preflight", reason: "threshold" });
+    expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId })).toMatchObject({ disposition: "hold", phase: "observed-preflight" });
+    expect(test.compact).not.toHaveBeenCalled();
+
+    test.coordinator.onSessionCompact(test.generationId, "threshold");
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+    expect(test.sendResume).not.toHaveBeenCalled();
+  });
+
+  it("releases automatic compaction as failed when the same generation settles without success", async () => {
+    const test = setup();
+    test.coordinator.onSessionBeforeCompact(test.generationId, "overflow");
+
+    test.coordinator.onAgentSettled(test.generationId);
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "failed" });
+    expect(test.sendResume).not.toHaveBeenCalled();
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "automatic-compaction-failed", outcome: "failed" }));
+  });
+
   it("requires exactly one manual durable event before managed onComplete", () => {
     const missing = setup();
     missing.coordinator.requestSelfCompaction("", "missing");
@@ -87,6 +114,19 @@ describe("managed lifecycle coordinator", () => {
     multiple.compact.mock.calls[0]?.[0].onComplete();
     expect(multiple.registry.snapshot().phase).toBe("blocked-unknown");
     expect(multiple.sendResume).not.toHaveBeenCalled();
+  });
+
+  it("releases the unchanged session after authoritative managed onError without resuming", async () => {
+    const test = setup();
+    test.coordinator.requestSelfCompaction("", "tool");
+    test.coordinator.onAgentSettled(test.generationId);
+
+    test.compact.mock.calls[0]?.[0].onError(new Error("provider rejected"));
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "failed" });
+    expect(test.sendResume).not.toHaveBeenCalled();
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "managed-compaction-failed", outcome: "failed" }));
   });
 
   it("does not send resume from a manual event until managed onComplete", () => {
@@ -165,6 +205,55 @@ describe("managed lifecycle coordinator", () => {
     expect(encoded).not.toContain(secret);
     expect(encoded).not.toContain("mesh-body-123");
     expect(test.coordinator.diagnostics().length).toBeLessThanOrEqual(100);
+  });
+
+  it("abandons an ambiguous resume only through exact CAS repair without resending", async () => {
+    const test = setup();
+    const accepted = test.coordinator.requestSelfCompaction("", "tool");
+    test.coordinator.onAgentSettled(test.generationId);
+    completeManagedCompaction(test);
+    expect(test.registry.snapshot().phase).toBe("resuming");
+
+    const operationId = accepted.disposition === "accepted" ? accepted.operationId : "missing";
+    test.coordinator.onResumeAdmissionDeadline(test.generationId, operationId);
+    const blocked = test.registry.snapshot();
+    expect(blocked).toMatchObject({ phase: "blocked-unknown", operationId, lastOutcome: "completed" });
+
+    expect(test.registry.repair({
+      action: "abandon-ambiguous-resume",
+      operationId,
+      sessionId: "session",
+      generationId: "stale-generation",
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "current-process-quiescent",
+      actor: "operator",
+      channel: "command",
+    })).toMatchObject({ disposition: "rejected", code: "generation-mismatch", generationId: test.generationId });
+    expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+
+    expect(test.registry.repair({
+      action: "abandon-ambiguous-resume",
+      operationId,
+      sessionId: "session",
+      generationId: test.generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "current-process-quiescent",
+      actor: "operator",
+      channel: "command",
+    })).toMatchObject({ disposition: "applied", action: "abandon-ambiguous-resume" });
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+    expect(test.sendResume).toHaveBeenCalledTimes(1);
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({
+      code: "repair-applied",
+      action: "abandon-ambiguous-resume",
+      evidenceClass: "current-process-quiescent",
+      actor: "operator",
+      channel: "command",
+    }));
   });
 
   it("invalidates permits and callbacks on disposal", () => {

@@ -34,6 +34,11 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
     if (generationId) coordinator.onAgentSettled(generationId);
   });
 
+  pi.on("session_before_compact", (event, ctx) => {
+    currentContext = ctx;
+    if (generationId) coordinator.onSessionBeforeCompact(generationId, event.reason);
+  });
+
   pi.on("session_compact", (event, ctx) => {
     currentContext = ctx;
     if (generationId) coordinator.onSessionCompact(generationId, event.reason);

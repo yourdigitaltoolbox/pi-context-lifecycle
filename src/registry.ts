@@ -9,6 +9,8 @@ import {
   type DrainerRegistration,
   type LifecycleEvent,
   type ReleasePermit,
+  type RepairDisposition,
+  type RepairRequest,
   type Snapshot,
   type WakeAdmission,
   type WakeDisposition,
@@ -101,6 +103,17 @@ function createRegistry(): StructuralRegistryV1 {
       if (!owner || snapshot.registryState !== "ready") throw new Error("Context lifecycle authority unavailable");
       return owner.publisher.registerDrainer(registration);
     },
+    repair(request: RepairRequest): RepairDisposition {
+      const rejected = (code: string): RepairDisposition => ({ disposition: "rejected", code, ...(snapshot.generationId === undefined ? {} : { generationId: snapshot.generationId }), sequence: snapshot.sequence });
+      if (typeof request.generationId !== "string" || request.generationId.length === 0) return { disposition: "rejected", code: "generation-required" };
+      if (snapshot.generationId !== undefined && request.generationId !== snapshot.generationId) return rejected("generation-mismatch");
+      if (!owner || snapshot.registryState !== "ready") return rejected(snapshot.registryState === "incompatible" ? "incompatible" : "authority-unavailable");
+      if (request.expectedSequence !== snapshot.sequence) return rejected("snapshot-sequence-mismatch");
+      if (request.sessionId !== snapshot.sessionId) return rejected("session-mismatch");
+      if (request.operationId !== snapshot.operationId) return rejected("operation-mismatch");
+      if (request.expectedPhase !== snapshot.phase) return rejected("phase-mismatch");
+      return owner.publisher.repair(request);
+    },
     diagnostics(): readonly DiagnosticRecord[] {
       return [...localDiagnostics, ...(owner?.publisher.diagnostics() ?? [])].slice(-MAX_DIAGNOSTICS).map((record) => ({ ...record }));
     },
@@ -159,6 +172,7 @@ function isStructuralRegistry(value: unknown): value is StructuralRegistryV1 {
     && typeof candidate.requestCompaction === "function"
     && typeof candidate.admitWake === "function"
     && typeof candidate.registerDrainer === "function"
+    && typeof candidate.repair === "function"
     && typeof candidate.diagnostics === "function"
     && typeof candidate.publish === "function";
 }
@@ -183,6 +197,9 @@ export function registryForHost(host: RegistryHost): StructuralRegistryV1 {
       ? { disposition: "reject", code: "generation-required" }
       : { disposition: "reject", code: "incompatible" },
     registerDrainer: () => { throw new Error("Incompatible context lifecycle registry"); },
+    repair: (request) => typeof request.generationId !== "string" || request.generationId.length === 0
+      ? { disposition: "rejected", code: "generation-required" }
+      : { disposition: "rejected", code: "incompatible" },
     diagnostics: () => [],
     publish: () => { throw new Error("Incompatible context lifecycle registry"); },
   };
@@ -194,5 +211,6 @@ export const observeContextLifecycleV1 = (listener: Listener): ReturnType<Contex
 export const requestCompaction = (request: CompactRequest): CompactDisposition => globalRegistry().requestCompaction(request);
 export const admitWake = (request: WakeAdmission, permit?: ReleasePermit): WakeDisposition => globalRegistry().admitWake(request, permit);
 export const registerContextLifecycleDrainerV1 = (registration: DrainerRegistration): (() => void) => globalRegistry().registerDrainer(registration);
+export const repairContextLifecycleV1 = (request: RepairRequest): RepairDisposition => globalRegistry().repair(request);
 export const getContextLifecycleDiagnosticsV1 = (): readonly DiagnosticRecord[] => globalRegistry().diagnostics();
 export const publishContextLifecycleV1 = (ownerInstanceId: string, publisher: CoordinatorPublisherV1, initial: Omit<Snapshot, "protocolVersion" | "registryState" | "sequence" | "ownerInstanceId">): CoordinatorPublicationV1 => globalRegistry().publish(ownerInstanceId, publisher, initial);
