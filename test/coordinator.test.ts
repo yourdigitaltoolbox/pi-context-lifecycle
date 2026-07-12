@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "../src/coordinator.js";
 import { registryForHost } from "../src/registry.js";
+import { CONTEXT_LIFECYCLE_RELEASE_LANES } from "../src/types.js";
 import type { CompactRequest, LifecycleClaim, ReleasePermit, WakeAdmission } from "../src/types.js";
+
+const TEST_LANE = "background-notify" as const;
 
 function setup() {
   const registry = registryForHost({});
@@ -68,7 +71,7 @@ describe("managed lifecycle coordinator", () => {
     const test = setup();
     test.coordinator.onSessionBeforeCompact(test.generationId, "manual");
     expect(test.registry.snapshot()).toMatchObject({ phase: "observed-preflight", reason: "builtin" });
-    expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
+    expect(test.coordinator.admitWake({ consumerId: "consumer", laneId: TEST_LANE, wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
 
     test.coordinator.onSessionCompact(test.generationId, "manual");
     await Promise.resolve();
@@ -83,7 +86,7 @@ describe("managed lifecycle coordinator", () => {
 
     test.coordinator.onSessionBeforeCompact(test.generationId, "threshold");
     expect(test.registry.snapshot()).toMatchObject({ phase: "observed-preflight", reason: "threshold" });
-    expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId })).toMatchObject({ disposition: "hold", phase: "observed-preflight" });
+    expect(test.coordinator.admitWake({ consumerId: "consumer", laneId: TEST_LANE, wakeId: "wake", sessionId: "session", generationId: test.generationId })).toMatchObject({ disposition: "hold", phase: "observed-preflight" });
     expect(test.compact).not.toHaveBeenCalled();
 
     test.coordinator.onSessionCompact(test.generationId, "threshold");
@@ -167,7 +170,7 @@ describe("managed lifecycle coordinator", () => {
       vi.advanceTimersByTime(1);
       expect(test.registry.snapshot().phase).toBe("blocked-unknown");
       expect(test.sendResume).not.toHaveBeenCalled();
-      expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
+      expect(test.coordinator.admitWake({ consumerId: "consumer", laneId: TEST_LANE, wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
     } finally {
       vi.useRealTimers();
     }
@@ -247,7 +250,7 @@ describe("managed lifecycle coordinator", () => {
 
     const missingWake = { consumerId: "consumer", wakeId: "missing", sessionId: "session" } as unknown as WakeAdmission;
     expect(test.coordinator.admitWake(missingWake)).toEqual({ disposition: "reject", code: "generation-required" });
-    expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "stale", sessionId: "session", generationId: "stale" })).toMatchObject({ disposition: "reject", code: "generation-mismatch", generationId: test.generationId });
+    expect(test.coordinator.admitWake({ consumerId: "consumer", laneId: TEST_LANE, wakeId: "stale", sessionId: "session", generationId: "stale" })).toMatchObject({ disposition: "reject", code: "generation-mismatch", generationId: test.generationId });
   });
 
   it("durably merges joined resume intent and safe pre-compaction focus", () => {
@@ -285,13 +288,13 @@ describe("managed lifecycle coordinator", () => {
       const waiting = new Promise<void>((resolve) => { finish = resolve; });
       test.coordinator.registerDrainer({
         consumerId: "consumer",
-        priority: 1,
+        laneId: TEST_LANE,
         generationId: test.generationId,
         capture: () => ({ watermark: 0, heldCount: 0 }),
         async drain(value) {
           permit = value;
           await waiting;
-          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
+          return { releaseId: value.releaseId, consumerId: value.consumerId, laneId: value.laneId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
         },
       });
       test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
@@ -305,7 +308,7 @@ describe("managed lifecycle coordinator", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(test.registry.snapshot().phase).toBe("blocked-unknown");
 
-      const wake = { consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId };
+      const wake = { consumerId: "consumer", laneId: TEST_LANE, wakeId: "wake", sessionId: "session", generationId: test.generationId };
       expect(test.coordinator.admitWake(wake, permit).disposition).toBe("hold");
       finish();
       await waiting;
@@ -316,13 +319,43 @@ describe("managed lifecycle coordinator", () => {
     }
   });
 
+  it("exports and enforces the seven-lane cut while allowing one consumer to own multiple lanes", async () => {
+    const test = setup();
+    const drained: string[] = [];
+    for (const laneId of [...CONTEXT_LIFECYCLE_RELEASE_LANES].reverse()) {
+      test.coordinator.registerDrainer({
+        consumerId: "multi-lane-consumer",
+        laneId,
+        generationId: test.generationId,
+        capture: () => ({ watermark: 0, heldCount: 0 }),
+        drain(permit) {
+          drained.push(permit.laneId);
+          return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: permit.cut.watermark };
+        },
+      });
+    }
+    expect(() => test.coordinator.registerDrainer({
+      consumerId: "multi-lane-consumer",
+      laneId: "mesh-reply",
+      generationId: test.generationId,
+      capture: () => ({ watermark: 0, heldCount: 0 }),
+      drain: () => { throw new Error("duplicate lane must not run"); },
+    })).toThrow(/already registered/);
+
+    test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+    test.coordinator.onAgentSettled(test.generationId);
+    completeManagedCompaction(test);
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
+    expect(drained).toEqual(CONTEXT_LIFECYCLE_RELEASE_LANES);
+  });
+
   it("captures one finite consumer watermark cut and does not absorb a post-cut arrival", async () => {
     const test = setup();
     const held = [{ sequence: 1, id: "A" }];
     let nextSequence = 1;
     test.coordinator.registerDrainer({
       consumerId: "consumer",
-      priority: 1,
+      laneId: TEST_LANE,
       generationId: test.generationId,
       capture() {
         return { watermark: nextSequence, heldCount: held.length };
@@ -335,6 +368,7 @@ describe("managed lifecycle coordinator", () => {
         return {
           releaseId: permit.releaseId,
           consumerId: permit.consumerId,
+          laneId: permit.laneId,
           disposition: "submitted",
           submittedCount: 1,
           handledCount: captured.length,
@@ -356,7 +390,7 @@ describe("managed lifecycle coordinator", () => {
     let attempts = 0;
     test.coordinator.registerDrainer({
       consumerId: "consumer",
-      priority: 1,
+      laneId: TEST_LANE,
       generationId: test.generationId,
       capture: () => ({ watermark: 0, heldCount: 0 }),
       drain(permit) {
@@ -365,6 +399,7 @@ describe("managed lifecycle coordinator", () => {
         return {
           releaseId: permit.releaseId,
           consumerId: permit.consumerId,
+          laneId: permit.laneId,
           disposition: attempts === 1 ? "blocked" : "empty",
           submittedCount: 0,
           handledCount: 0,
@@ -389,6 +424,7 @@ describe("managed lifecycle coordinator", () => {
       actor: "operator",
       channel: "command",
       consumerId: "consumer",
+      laneId: TEST_LANE,
     })).toMatchObject({ disposition: "applied", action: "retry-blocked-drainer" });
     await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
 
@@ -404,20 +440,20 @@ describe("managed lifecycle coordinator", () => {
     const waiting = new Promise<void>((resolve) => { finish = resolve; });
     test.coordinator.registerDrainer({
       consumerId: "consumer",
-      priority: 1,
+      laneId: TEST_LANE,
       generationId: test.generationId,
       capture: () => ({ watermark: 0, heldCount: 0 }),
       async drain(value) {
         permit = value;
         await waiting;
-        return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
+        return { releaseId: value.releaseId, consumerId: value.consumerId, laneId: value.laneId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
       },
     });
     test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
     test.coordinator.onAgentSettled(test.generationId);
     completeManagedCompaction(test);
     expect(permit).toBeDefined();
-    const wake = { consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId };
+    const wake = { consumerId: "consumer", laneId: TEST_LANE, wakeId: "wake", sessionId: "session", generationId: test.generationId };
     expect(test.coordinator.admitWake(wake, { ...permit }).disposition).toBe("hold");
     expect(test.coordinator.admitWake(wake, permit)).toMatchObject({ disposition: "deliver", code: "release-permit" });
     finish();
@@ -743,12 +779,12 @@ describe("managed lifecycle coordinator", () => {
       const waiting = new Promise<void>((resolve) => { finish = resolve; });
       test.coordinator.registerDrainer({
         consumerId: "consumer",
-        priority: 1,
+        laneId: TEST_LANE,
         generationId: test.generationId,
         capture: () => ({ watermark: 0, heldCount: 0 }),
         async drain(value) {
           await waiting;
-          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
+          return { releaseId: value.releaseId, consumerId: value.consumerId, laneId: value.laneId, disposition: "empty", submittedCount: 0, handledCount: 0, handledThrough: value.cut.watermark };
         },
       });
       test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });

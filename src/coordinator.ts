@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { CONTEXT_LIFECYCLE_RELEASE_LANES } from "./types.js";
 import type {
   CompactDisposition,
   CompactRequest,
@@ -9,6 +10,7 @@ import type {
   DrainerRegistration,
   LifecycleClaim,
   LifecycleClaimState,
+  LifecycleLane,
   OperationOutcome,
   Phase,
   ReleasePermit,
@@ -27,6 +29,15 @@ const COMPACTION_BLOCK_MS = 10 * 60 * 1000;
 const RESUME_WARNING_MS = 30 * 1000;
 const RESUME_BLOCK_MS = 60 * 1000;
 const DRAINER_BLOCK_MS = 5 * 1000;
+const LANE_ORDER = new Map<LifecycleLane, number>(CONTEXT_LIFECYCLE_RELEASE_LANES.map((laneId, index) => [laneId, index]));
+
+function drainerKey(consumerId: string, laneId: LifecycleLane): string {
+  return `${consumerId}\u0000${laneId}`;
+}
+
+function isLifecycleLane(value: unknown): value is LifecycleLane {
+  return typeof value === "string" && (CONTEXT_LIFECYCLE_RELEASE_LANES as readonly string[]).includes(value);
+}
 
 export interface ManagedCompactionAdapter {
   compact(options: { customInstructions: string; onComplete(): void; onError(error: Error): void }): void;
@@ -113,6 +124,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private releaseCut: CapturedDrainer[] | undefined;
   private releaseIndex = 0;
   private blockedDrainerConsumerId: string | undefined;
+  private blockedDrainerLaneId: LifecycleLane | undefined;
   private compactionWarningTimer: ReturnType<typeof setTimeout> | undefined;
   private compactionBlockTimer: ReturnType<typeof setTimeout> | undefined;
   private resumeWarningTimer: ReturnType<typeof setTimeout> | undefined;
@@ -415,12 +427,13 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
 
   admitWake(request: WakeAdmission, permit?: ReleasePermit): WakeDisposition {
     if (typeof request.generationId !== "string" || request.generationId.length === 0) return { disposition: "reject", code: "generation-required" };
+    if (!isLifecycleLane(request.laneId)) return { disposition: "reject", code: "lane-invalid" };
     if (this.disposed || !this.sessionId || !this.generationId || !this.phase) return { disposition: "reject", code: "session-unavailable" };
     const identity = { phase: this.phase, generationId: this.generationId, ...(this.operation === undefined ? {} : { operationId: this.operation.id }) };
     if (request.sessionId !== this.sessionId) return { disposition: "reject", code: "session-mismatch", ...identity };
     if (request.generationId !== this.generationId) return { disposition: "reject", code: "generation-mismatch", ...identity };
     if (this.phase === "idle") return { disposition: "deliver", code: "idle", ...identity };
-    if (this.phase === "releasing" && permit !== undefined && this.activePermits.has(permit) && permit.consumerId === request.consumerId && permit.sessionId === this.sessionId && permit.generationId === this.generationId && permit.operationId === this.operation?.id) {
+    if (this.phase === "releasing" && permit !== undefined && this.activePermits.has(permit) && permit.consumerId === request.consumerId && permit.laneId === request.laneId && permit.sessionId === this.sessionId && permit.generationId === this.generationId && permit.operationId === this.operation?.id) {
       return { disposition: "deliver", code: "release-permit", ...identity };
     }
     return { disposition: "hold", code: this.phase === "releasing" ? "release-permit-required" : "lifecycle-active", ...identity };
@@ -428,14 +441,16 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
 
   registerDrainer(registration: DrainerRegistration): () => void {
     if (this.disposed || registration.generationId !== this.generationId) throw new Error("Drainer generation mismatch");
-    if (this.drainers.has(registration.consumerId)) throw new Error(`Drainer already registered: ${registration.consumerId}`);
-    const stored: RegisteredDrainer = { ...registration, token: Symbol(registration.consumerId) };
-    this.drainers.set(registration.consumerId, stored);
+    if (!isLifecycleLane(registration.laneId)) throw new Error("Drainer lane is invalid");
+    const key = drainerKey(registration.consumerId, registration.laneId);
+    if (this.drainers.has(key)) throw new Error(`Drainer already registered: ${registration.consumerId}/${registration.laneId}`);
+    const stored: RegisteredDrainer = { ...registration, token: Symbol(key) };
+    this.drainers.set(key, stored);
     let registered = true;
     return () => {
       if (!registered) return;
       registered = false;
-      if (this.drainers.get(registration.consumerId)?.token === stored.token) this.drainers.delete(registration.consumerId);
+      if (this.drainers.get(key)?.token === stored.token) this.drainers.delete(key);
     };
   }
 
@@ -517,7 +532,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (request.action === "retry-blocked-drainer") {
       const drainer = this.releaseCut?.[this.releaseIndex]?.registration;
       const retryableBlock = this.blockedReason === "drainer-deadline" || this.blockedReason === "drainer-threw" || this.blockedReason === "drainer-blocked";
-      if (!retryableBlock || request.evidenceClass !== "idempotent-drainer-state" || request.consumerId === undefined || request.consumerId !== this.blockedDrainerConsumerId || drainer?.consumerId !== request.consumerId) return reject("repair-not-applicable");
+      if (!retryableBlock || request.evidenceClass !== "idempotent-drainer-state" || request.consumerId === undefined || request.laneId === undefined || request.consumerId !== this.blockedDrainerConsumerId || request.laneId !== this.blockedDrainerLaneId || drainer?.consumerId !== request.consumerId || drainer.laneId !== request.laneId) return reject("repair-not-applicable");
       this.record("repair-applied", {
         action: request.action,
         evidenceClass: request.evidenceClass,
@@ -562,6 +577,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.releaseCut = undefined;
     this.releaseIndex = 0;
     this.blockedDrainerConsumerId = undefined;
+    this.blockedDrainerLaneId = undefined;
     this.phase = undefined;
     this.adapter = undefined;
     const result = this.publication?.dispose() ?? false;
@@ -597,9 +613,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.clearAllDeadlines();
     this.blockedReason = undefined;
     this.blockedDrainerConsumerId = undefined;
+    this.blockedDrainerLaneId = undefined;
     this.phase = "releasing";
     if (!retryBlockedDrainer) {
-      const registrations = [...this.drainers.values()].sort((left, right) => left.priority - right.priority || left.consumerId.localeCompare(right.consumerId));
+      const registrations = [...this.drainers.values()].sort((left, right) => (LANE_ORDER.get(left.laneId) ?? Number.MAX_SAFE_INTEGER) - (LANE_ORDER.get(right.laneId) ?? Number.MAX_SAFE_INTEGER) || left.consumerId.localeCompare(right.consumerId));
       try {
         this.releaseCut = registrations.map((registration) => {
           const cut = registration.capture();
@@ -629,6 +646,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         operationId: operation.id,
         releaseId: randomUUID(),
         consumerId: drainer.consumerId,
+        laneId: drainer.laneId,
         cut: captured.cut,
       });
       this.activePermits.add(permit);
@@ -638,6 +656,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       } catch {
         this.activePermits.delete(permit);
         this.blockedDrainerConsumerId = drainer.consumerId;
+        this.blockedDrainerLaneId = drainer.laneId;
         this.block("drainer-threw");
         return;
       }
@@ -646,23 +665,27 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       this.activePermits.delete(permit);
       if (outcome.kind === "timeout") {
         this.blockedDrainerConsumerId = drainer.consumerId;
+        this.blockedDrainerLaneId = drainer.laneId;
         this.block("drainer-deadline");
         return;
       }
       if (outcome.kind === "threw") {
         this.blockedDrainerConsumerId = drainer.consumerId;
+        this.blockedDrainerLaneId = drainer.laneId;
         this.block("drainer-threw");
         return;
       }
       const ack = outcome.ack;
       if (ack.releaseId !== permit.releaseId
         || ack.consumerId !== permit.consumerId
+        || ack.laneId !== permit.laneId
         || !Number.isSafeInteger(ack.submittedCount) || ack.submittedCount < 0
         || !Number.isSafeInteger(ack.handledCount) || ack.handledCount !== permit.cut.heldCount
         || ack.handledThrough !== permit.cut.watermark
         || (ack.disposition === "empty" && permit.cut.heldCount !== 0)
         || ack.disposition === "blocked") {
         this.blockedDrainerConsumerId = drainer.consumerId;
+        this.blockedDrainerLaneId = drainer.laneId;
         this.block("drainer-blocked");
         return;
       }

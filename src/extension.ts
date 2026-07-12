@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "./coordinator.js";
 import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, publishContextLifecycleV1, repairContextLifecycleV1 } from "./registry.js";
+import { CONTEXT_LIFECYCLE_RELEASE_LANES } from "./types.js";
 import type { CompactionReason, LifecycleClaim, LifecycleClaimState, RepairAction, RepairEvidenceClass, RepairRequest } from "./types.js";
 
 const DEFAULT_HANDOFF_THRESHOLD = 0.94;
@@ -94,6 +95,7 @@ function verifyPersistedResumeEvidence(ctx: ExtensionContext, request: RepairReq
 }
 
 const REPAIR_ACTIONS = new Set<RepairAction>(["recognize-resume-admitted", "retry-resume-pending", "abandon-ambiguous-resume", "retry-blocked-drainer", "abandon-interrupted-operation"]);
+const RELEASE_LANES = new Set<string>(CONTEXT_LIFECYCLE_RELEASE_LANES);
 const REPAIR_EVIDENCE_CLASSES = new Set<RepairEvidenceClass>(["persisted-resume-message", "persisted-resume-run-settled", "no-admission-attempt", "current-process-quiescent", "owner-process-replaced", "idempotent-drainer-state", "branch-validated-owner-replaced"]);
 
 function parseRepairRequest(value: string): RepairRequest | undefined {
@@ -109,6 +111,7 @@ function parseRepairRequest(value: string): RepairRequest | undefined {
       || typeof request.generationId !== "string" || request.generationId.length === 0
       || typeof request.expectedSequence !== "number" || !Number.isSafeInteger(request.expectedSequence) || request.expectedSequence < 0
       || (request.consumerId !== undefined && (typeof request.consumerId !== "string" || request.consumerId.length === 0))
+      || (request.laneId !== undefined && (typeof request.laneId !== "string" || !RELEASE_LANES.has(request.laneId)))
       || (request.evidenceEntryId !== undefined && (typeof request.evidenceEntryId !== "string" || request.evidenceEntryId.length === 0))) return undefined;
     return request as unknown as RepairRequest;
   } catch {

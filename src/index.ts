@@ -10,6 +10,7 @@ export {
 export {
   CONTEXT_LIFECYCLE_PROTOCOL_VERSION,
   CONTEXT_LIFECYCLE_REGISTRY_SYMBOL,
+  CONTEXT_LIFECYCLE_RELEASE_LANES,
   type CompactDisposition,
   type CompactRequest,
   type ContextLifecycleV1,
@@ -19,6 +20,7 @@ export {
   type LifecycleClaim,
   type LifecycleClaimState,
   type LifecycleEvent,
+  type LifecycleLane,
   type OperationOutcome,
   type Phase,
   type RegistryState,

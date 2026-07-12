@@ -1,5 +1,15 @@
 export const CONTEXT_LIFECYCLE_PROTOCOL_VERSION = 1 as const;
 export const CONTEXT_LIFECYCLE_REGISTRY_SYMBOL = Symbol.for("yourdigitaltoolbox.pi-context-lifecycle.v1");
+export const CONTEXT_LIFECYCLE_RELEASE_LANES = [
+  "failure-attention-decision",
+  "mesh-reply",
+  "mesh-unsolicited",
+  "subagent-success",
+  "background-notify",
+  "loop-tick",
+  "cron-tick",
+] as const;
+export type LifecycleLane = typeof CONTEXT_LIFECYCLE_RELEASE_LANES[number];
 
 export type RegistryState = "unavailable" | "ready" | "disposing" | "incompatible";
 export type Phase =
@@ -72,6 +82,7 @@ export type CompactDisposition =
 
 export interface WakeAdmission {
   consumerId: string;
+  laneId: LifecycleLane;
   wakeId: string;
   sessionId: string;
   generationId: string;
@@ -98,12 +109,14 @@ export interface ReleasePermit {
   readonly operationId: string;
   readonly releaseId: string;
   readonly consumerId: string;
+  readonly laneId: LifecycleLane;
   readonly cut: ReleaseWatermark;
 }
 
 export interface DrainAck {
   releaseId: string;
   consumerId: string;
+  laneId: LifecycleLane;
   disposition: "empty" | "submitted" | "blocked";
   submittedCount: number;
   handledCount: number;
@@ -112,7 +125,7 @@ export interface DrainAck {
 
 export interface DrainerRegistration {
   consumerId: string;
-  priority: number;
+  laneId: LifecycleLane;
   generationId: string;
   capture(): ReleaseWatermark;
   drain(permit: ReleasePermit): Promise<DrainAck> | DrainAck;
@@ -146,6 +159,7 @@ export interface RepairRequest {
   actor: RepairActor;
   channel: RepairChannel;
   consumerId?: string;
+  laneId?: LifecycleLane;
   evidenceEntryId?: string;
 }
 
@@ -163,6 +177,7 @@ export interface DiagnosticRecord {
   generationId?: string;
   operationId?: string;
   consumerId?: string;
+  laneId?: LifecycleLane;
   phase?: Phase;
   priorPhase?: Phase;
   newPhase?: Phase;

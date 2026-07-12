@@ -78,13 +78,13 @@ describe("structural v1 registry", () => {
     expect(unavailable.requestCompaction(missingCompact)).toEqual({ disposition: "rejected", code: "generation-required" });
     expect(unavailable.admitWake(missingWake)).toEqual({ disposition: "reject", code: "generation-required" });
     expect(unavailable.requestCompaction({ requestId: "r", sessionId: "s", generationId: "g", reason: "self" })).toEqual({ disposition: "rejected", code: "authority-unavailable" });
-    expect(unavailable.admitWake({ consumerId: "c", wakeId: "w", sessionId: "s", generationId: "g" })).toEqual({ disposition: "reject", code: "authority-unavailable" });
+    expect(unavailable.admitWake({ consumerId: "c", laneId: "background-notify", wakeId: "w", sessionId: "s", generationId: "g" })).toEqual({ disposition: "reject", code: "authority-unavailable" });
 
     const symbol = Symbol.for("yourdigitaltoolbox.pi-context-lifecycle.v1");
     const incompatible = registryForHost({ [symbol]: { protocolVersion: 2 } });
     expect(incompatible.snapshot().registryState).toBe("incompatible");
     expect(incompatible.admitWake(missingWake).code).toBe("generation-required");
-    expect(incompatible.admitWake({ consumerId: "c", wakeId: "w", sessionId: "s", generationId: "g" }).code).toBe("incompatible");
+    expect(incompatible.admitWake({ consumerId: "c", laneId: "background-notify", wakeId: "w", sessionId: "s", generationId: "g" }).code).toBe("incompatible");
   });
 
   it("rejects stale repair generation, sequence, and operation before delegation", () => {
@@ -117,11 +117,11 @@ describe("structural v1 registry", () => {
     const registry = registryForHost({});
     registry.publish("owner", { ...publisher(), requestCompaction: compact, admitWake: admit }, { phase: "compacting", generationId: "generation", operationId: "operation" });
     expect(registry.requestCompaction({ requestId: "request", sessionId: "session", generationId: "stale", reason: "remote" })).toEqual({ disposition: "rejected", code: "generation-mismatch", generationId: "generation" });
-    expect(registry.admitWake({ consumerId: "consumer", wakeId: "stale", sessionId: "session", generationId: "stale" })).toMatchObject({ disposition: "reject", code: "generation-mismatch", generationId: "generation" });
+    expect(registry.admitWake({ consumerId: "consumer", laneId: "background-notify", wakeId: "stale", sessionId: "session", generationId: "stale" })).toMatchObject({ disposition: "reject", code: "generation-mismatch", generationId: "generation" });
     expect(compact).not.toHaveBeenCalled();
     expect(admit).not.toHaveBeenCalled();
 
-    const admission = { consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: "generation" };
+    const admission = { consumerId: "consumer", laneId: "background-notify" as const, wakeId: "wake", sessionId: "session", generationId: "generation" };
     const result = registry.admitWake(admission);
     expect(result.disposition).toBe("hold");
     expect(admit).toHaveBeenCalledWith(admission, undefined);
