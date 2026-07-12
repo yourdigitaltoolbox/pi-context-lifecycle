@@ -12,6 +12,28 @@ export type Phase =
   | "blocked-unknown";
 export type CompactionReason = "self" | "remote" | "builtin" | "threshold" | "overflow";
 export type OperationOutcome = "completed" | "failed" | "cancelled" | "timed-out";
+export type LifecycleClaimState =
+  | "requested"
+  | "compacting"
+  | "compacted"
+  | "resume-pending"
+  | "resume-admitting"
+  | "resume-admitted"
+  | "resume-settled"
+  | "released"
+  | "failed"
+  | "cancelled"
+  | "blocked-unknown";
+
+export interface LifecycleClaim {
+  schemaVersion: 1;
+  operationId: string;
+  sessionId: string;
+  generationId: string;
+  state: LifecycleClaimState;
+  reason: CompactionReason;
+  timestamp: number;
+}
 
 export interface Snapshot {
   protocolVersion: 1;

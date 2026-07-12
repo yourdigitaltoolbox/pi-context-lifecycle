@@ -73,38 +73,57 @@ function handoffKickoff(handoffPath: string, nextStep: string): string {
 }
 
 export default function contextLifecycleExtension(pi: ExtensionAPI): void {
-  const coordinator = new ContextLifecycleCoordinatorV1();
-  const publication = publishContextLifecycleV1(coordinator.ownerInstanceId, coordinator, {});
-  coordinator.attachPublication(publication);
-  let generationId: string | undefined;
-  let currentContext: ExtensionContext | undefined;
+  interface SessionBinding {
+    sessionId: string;
+    generationId: string;
+    context: ExtensionContext;
+  }
+
+  let coordinator: ContextLifecycleCoordinatorV1 | undefined;
+  let activeBinding: SessionBinding | undefined;
   let commandRequestSequence = 0;
   let handoffWatcherArmed = true;
   const handoffThreshold = ratioFromEnv(process.env.PI_CONTEXT_HANDOFF_THRESHOLD, DEFAULT_HANDOFF_THRESHOLD);
   const handoffRearmThreshold = ratioFromEnv(process.env.PI_CONTEXT_HANDOFF_REARM_THRESHOLD, DEFAULT_HANDOFF_REARM_THRESHOLD);
 
-  const adapter: ManagedCompactionAdapter = {
-    compact(options) {
-      if (!currentContext) throw new Error("No active Pi extension context");
-      currentContext.compact(options);
-    },
-    sendResume(message) {
-      pi.sendUserMessage(message, { deliverAs: "steer" });
-    },
+  const bindingFor = (ctx: ExtensionContext): SessionBinding | undefined => {
+    const binding = activeBinding;
+    return binding !== undefined && ctx.sessionManager.getSessionId() === binding.sessionId ? binding : undefined;
   };
 
   pi.on("session_start", (_event, ctx) => {
-    currentContext = ctx;
-    generationId = coordinator.bindSession(ctx.sessionManager.getSessionId(), adapter);
+    coordinator?.dispose();
+    const next = new ContextLifecycleCoordinatorV1();
+    const publication = publishContextLifecycleV1(next.ownerInstanceId, next, {});
+    next.attachPublication(publication);
+    const binding = { sessionId: ctx.sessionManager.getSessionId(), generationId: "", context: ctx };
+    const adapter: ManagedCompactionAdapter = {
+      compact(options) {
+        binding.context.compact(options);
+      },
+      sendResume(message) {
+        pi.sendUserMessage(message, { deliverAs: "steer" });
+      },
+      appendLifecycleEntry(claim) {
+        pi.appendEntry("pi-context-lifecycle", claim);
+      },
+    };
+    binding.generationId = next.bindSession(binding.sessionId, adapter);
+    coordinator = next;
+    activeBinding = binding;
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    currentContext = ctx;
-    if (generationId) coordinator.onAgentSettled(generationId);
+    const binding = bindingFor(ctx);
+    if (binding === undefined) return;
+    binding.context = ctx;
+    coordinator?.onAgentSettled(binding.generationId);
   });
 
   pi.on("turn_end", (_event, ctx) => {
-    currentContext = ctx;
+    const binding = bindingFor(ctx);
+    if (binding === undefined) return;
+    binding.context = ctx;
     const usage = ctx.getContextUsage();
     if (usage === undefined || usage.tokens === null || usage.contextWindow <= 0) return;
     const percent = usage.tokens / usage.contextWindow;
@@ -122,24 +141,32 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_before_compact", (event, ctx) => {
-    currentContext = ctx;
-    if (generationId) coordinator.onSessionBeforeCompact(generationId, event.reason);
+    const binding = bindingFor(ctx);
+    if (binding === undefined) return;
+    binding.context = ctx;
+    coordinator?.onSessionBeforeCompact(binding.generationId, event.reason);
   });
 
   pi.on("session_compact", (event, ctx) => {
-    currentContext = ctx;
-    if (generationId) coordinator.onSessionCompact(generationId, event.reason);
+    const binding = bindingFor(ctx);
+    if (binding === undefined) return;
+    binding.context = ctx;
+    coordinator?.onSessionCompact(binding.generationId, event.reason);
   });
 
   pi.on("message_start", (event, ctx) => {
-    currentContext = ctx;
-    if (generationId) coordinator.onMessageStart(generationId, event.message);
+    const binding = bindingFor(ctx);
+    if (binding === undefined) return;
+    binding.context = ctx;
+    coordinator?.onMessageStart(binding.generationId, event.message);
   });
 
-  pi.on("session_shutdown", () => {
-    generationId = undefined;
-    currentContext = undefined;
-    coordinator.dispose();
+  pi.on("session_shutdown", (_event, ctx) => {
+    const binding = bindingFor(ctx);
+    if (binding === undefined) return;
+    coordinator?.dispose();
+    coordinator = undefined;
+    activeBinding = undefined;
   });
 
   pi.registerCommand("context-lifecycle", {
@@ -173,8 +200,11 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
     pi.registerCommand(commandName, {
       description: "Request managed context compaction and one correlated resume turn.",
       handler: (args, ctx) => {
-        currentContext = ctx;
-        const disposition = coordinator.requestSelfCompactionFromCommand(args, `command:${commandName}:${++commandRequestSequence}`);
+        const binding = bindingFor(ctx);
+        if (binding !== undefined) binding.context = ctx;
+        const disposition = binding === undefined
+          ? { disposition: "rejected" as const, code: "session-unavailable" }
+          : coordinator?.requestSelfCompactionFromCommand(args, `command:${commandName}:${++commandRequestSequence}`) ?? { disposition: "rejected" as const, code: "session-unavailable" };
         if (ctx.hasUI) {
           const level = disposition.disposition === "rejected" ? "warning" : "info";
           ctx.ui.notify(`Self compact ${disposition.disposition}${disposition.disposition === "rejected" ? ` (${disposition.code})` : ` as ${disposition.operationId}`}.`, level);
@@ -223,7 +253,7 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
       instructions: Type.Optional(Type.String({ description: "Optional focus for what the compaction summary and resumed turn should preserve and reload." })),
     }),
     execute(toolCallId, params) {
-      const disposition = coordinator.requestSelfCompaction(params.instructions ?? "", toolCallId);
+      const disposition = coordinator?.requestSelfCompaction(params.instructions ?? "", toolCallId) ?? { disposition: "rejected" as const, code: "session-unavailable" };
       if (disposition.disposition === "rejected") return Promise.resolve(textToolResult(`Self compact rejected (${disposition.code}); no compaction was started.`));
       if (disposition.disposition === "joined") return Promise.resolve(textToolResult(`Self compact request joined managed operation ${disposition.operationId}; compaction will start after this run settles.`));
       return Promise.resolve(textToolResult(`Self compact accepted as managed operation ${disposition.operationId}; compaction will start after this tool result and agent run settle.`));

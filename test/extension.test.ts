@@ -19,11 +19,13 @@ function harness() {
   const tools = new Map<string, RegisteredToolLike>();
   const commands = new Map<string, RegisteredCommandLike>();
   const sendUserMessage = vi.fn();
+  const appendEntry = vi.fn();
   const api = {
     on(event: string, handler: Handler) { handlers.set(event, handler); },
     registerTool(value: RegisteredToolLike) { tools.set(value.name, value); },
     registerCommand(name: string, value: RegisteredCommandLike) { commands.set(name, value); },
     sendUserMessage,
+    appendEntry,
   } as unknown as ExtensionAPI;
   const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
   let contextUsage: { tokens: number; contextWindow: number; percent: number } | undefined;
@@ -32,13 +34,14 @@ function harness() {
     compact,
     getContextUsage: () => contextUsage,
   } as unknown as ExtensionContext;
-  const emit = (name: string, event: Record<string, unknown> = {}) => handlers.get(name)?.(event, context);
+  const emit = (name: string, event: Record<string, unknown> = {}, eventContext: ExtensionContext = context) => handlers.get(name)?.(event, eventContext);
   return {
     api,
     compact,
     context,
     emit,
     sendUserMessage,
+    appendEntry,
     setContextUsage(tokens: number, contextWindow: number) { contextUsage = { tokens, contextWindow, percent: tokens / contextWindow }; },
     getTool: (name = "self_compact") => tools.get(name),
     getCommand: (name: string) => commands.get(name),
@@ -206,6 +209,67 @@ describe("Pi extension tracer", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("rebinds a replacement session and keeps old-session callbacks and contexts inert", async () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+    const oldGeneration = getContextLifecycleSnapshotV1().generationId;
+    await test.getTool()?.execute("old-tool", {});
+    test.emit("agent_settled", { type: "agent_settled" });
+    expect(test.compact).toHaveBeenCalledTimes(1);
+    const oldComplete = () => test.compact.mock.calls[0]?.[0].onComplete();
+
+    test.emit("session_shutdown", { type: "session_shutdown", reason: "new" });
+    const newCompact = vi.fn<ManagedCompactionAdapter["compact"]>();
+    const newContext = {
+      sessionManager: { getSessionId: () => "replacement-session" },
+      compact: newCompact,
+      getContextUsage: () => undefined,
+    } as unknown as ExtensionContext;
+    test.emit("session_start", { type: "session_start", reason: "new" }, newContext);
+    const replacement = getContextLifecycleSnapshotV1();
+    expect(replacement).toMatchObject({ registryState: "ready", sessionId: "replacement-session", phase: "idle" });
+    expect(replacement.generationId).not.toBe(oldGeneration);
+
+    oldComplete();
+    test.emit("agent_settled", { type: "agent_settled" }, test.context);
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ sessionId: "replacement-session", phase: "idle" });
+    expect(newCompact).not.toHaveBeenCalled();
+
+    await test.getTool()?.execute("new-tool", {});
+    test.emit("agent_settled", { type: "agent_settled" }, newContext);
+    expect(newCompact).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists the bounded managed operation and resume claim sequence without content", async () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+    await test.getTool()?.execute("tool-call", { instructions: "sensitive focus must not persist" });
+    test.emit("agent_settled", { type: "agent_settled" });
+    test.emit("session_compact", { type: "session_compact", reason: "manual", fromExtension: false });
+    test.compact.mock.calls[0]?.[0].onComplete();
+    const resume = test.sendUserMessage.mock.calls[0]?.[0] as string;
+    test.emit("message_start", { type: "message_start", message: { role: "user", content: resume } });
+    test.emit("agent_settled", { type: "agent_settled" });
+    await Promise.resolve();
+
+    const claims = test.appendEntry.mock.calls
+      .filter(([customType]) => customType === "pi-context-lifecycle")
+      .map(([, claim]) => claim as { state: string });
+    expect(claims.map((claim) => claim.state)).toEqual([
+      "requested",
+      "compacting",
+      "compacted",
+      "resume-pending",
+      "resume-admitting",
+      "resume-admitted",
+      "resume-settled",
+      "released",
+    ]);
+    expect(JSON.stringify(claims)).not.toContain("sensitive focus must not persist");
   });
 
   it("does not attribute a threshold event to the managed compact call", async () => {

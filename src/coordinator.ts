@@ -7,6 +7,8 @@ import type {
   DiagnosticRecord,
   DrainAck,
   DrainerRegistration,
+  LifecycleClaim,
+  LifecycleClaimState,
   OperationOutcome,
   Phase,
   ReleasePermit,
@@ -28,6 +30,7 @@ const DRAINER_BLOCK_MS = 5 * 1000;
 export interface ManagedCompactionAdapter {
   compact(options: { customInstructions: string; onComplete(): void; onError(error: Error): void }): void;
   sendResume(message: string): void;
+  appendLifecycleEntry?(claim: LifecycleClaim): void;
 }
 
 interface ActiveOperation {
@@ -170,6 +173,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       resumeMessageMatched: false,
     };
     this.phase = "pending-settle";
+    if (!this.persistClaim("requested")) {
+      this.block("claim-persist-failed", false);
+      return { disposition: "rejected", code: "claim-persist-failed", generationId: this.generationId };
+    }
     this.transition("request-accepted");
     return { disposition: "accepted", operationId: this.operation.id, generationId: this.generationId };
   }
@@ -182,11 +189,18 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     }
     if (this.phase === "observed-preflight" && !this.operation.managed) {
       this.lastOutcome = "failed";
+      this.persistClaim("failed");
       this.record("automatic-compaction-failed");
       void this.release();
       return;
     }
-    if (this.phase === "resuming" && this.operation.resumeMessageMatched) void this.release();
+    if (this.phase === "resuming" && this.operation.resumeMessageMatched) {
+      if (!this.persistClaim("resume-settled")) {
+        this.block("claim-persist-failed", false);
+        return;
+      }
+      void this.release();
+    }
   }
 
   onSessionBeforeCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
@@ -213,6 +227,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       resumeMessageMatched: false,
     };
     this.phase = "observed-preflight";
+    if (!this.persistClaim("compacting")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
     this.transition("automatic-compaction-preflight-observed");
     this.scheduleCompactionDeadlines(this.operation.id);
   }
@@ -226,6 +244,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       }
       this.clearCompactionDeadlines();
       this.lastOutcome = "completed";
+      if (!this.persistClaim("compacted")) {
+        this.block("claim-persist-failed", false);
+        return;
+      }
       this.record("automatic-compaction-succeeded");
       void this.release();
       return;
@@ -257,11 +279,19 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     }
     this.clearCompactionDeadlines();
     this.lastOutcome = "completed";
+    if (!this.persistClaim("compacted")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
     if (!this.operation.resume) {
       void this.release();
       return;
     }
     this.phase = "resuming";
+    if (!this.persistClaim("resume-pending") || !this.persistClaim("resume-admitting")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
     this.transition("compaction-succeeded");
     this.scheduleResumeDeadlines(this.operation.id);
     this.adapter?.sendResume(this.operation.resumeMessage);
@@ -282,6 +312,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     }
     this.clearCompactionDeadlines();
     this.lastOutcome = "failed";
+    if (!this.persistClaim("failed")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
     this.record(resolvesDeadlineBlock ? "late-managed-compaction-failure" : "managed-compaction-failed");
     void this.release(resolvesDeadlineBlock);
   }
@@ -291,6 +325,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (message.role !== "user" || exactTextContent(message.content) !== this.operation.resumeMessage) return;
     this.operation.resumeMessageMatched = true;
     this.clearResumeDeadlines();
+    if (!this.persistClaim("resume-admitted")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
     this.record("resume-message-matched");
   }
 
@@ -373,6 +411,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (!this.operation || this.operation.compactStarted || !this.adapter) return;
     this.operation.compactStarted = true;
     this.phase = "compacting";
+    if (!this.persistClaim("compacting")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
     this.transition("compaction-started");
     const generation = this.generationId;
     const operationId = this.operation.id;
@@ -433,17 +475,41 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       }
     }
     if (this.operation !== operation || this.disposed) return;
+    if (!this.persistClaim("released")) {
+      this.block("claim-persist-failed", false);
+      return;
+    }
     this.operation = undefined;
     this.phase = "idle";
     this.transition("release-completed");
   }
 
-  private block(code: string): void {
+  private block(code: string, persist = true): void {
     if (this.phase === "blocked-unknown") return;
     this.clearAllDeadlines();
     this.blockedReason = code;
     this.phase = "blocked-unknown";
+    if (persist) this.persistClaim("blocked-unknown");
     this.transition(code);
+  }
+
+  private persistClaim(state: LifecycleClaimState): boolean {
+    if (!this.operation || !this.sessionId || !this.generationId) return false;
+    try {
+      this.adapter?.appendLifecycleEntry?.({
+        schemaVersion: 1,
+        operationId: this.operation.id,
+        sessionId: this.sessionId,
+        generationId: this.generationId,
+        state,
+        reason: this.operation.reason,
+        timestamp: Date.now(),
+      });
+      return true;
+    } catch {
+      this.record("claim-persist-error");
+      return false;
+    }
   }
 
   private async waitForDrainer(pendingAck: Promise<DrainAck> | DrainAck): Promise<{ kind: "ack"; ack: DrainAck } | { kind: "threw" } | { kind: "timeout" }> {

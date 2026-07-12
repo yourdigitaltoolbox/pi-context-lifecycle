@@ -16,6 +16,8 @@ export {
   type DiagnosticRecord,
   type DrainAck,
   type DrainerRegistration,
+  type LifecycleClaim,
+  type LifecycleClaimState,
   type LifecycleEvent,
   type OperationOutcome,
   type Phase,
