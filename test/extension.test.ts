@@ -26,12 +26,23 @@ function harness() {
     sendUserMessage,
   } as unknown as ExtensionAPI;
   const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
+  let contextUsage: { tokens: number; contextWindow: number; percent: number } | undefined;
   const context = {
     sessionManager: { getSessionId: () => "session" },
     compact,
+    getContextUsage: () => contextUsage,
   } as unknown as ExtensionContext;
   const emit = (name: string, event: Record<string, unknown> = {}) => handlers.get(name)?.(event, context);
-  return { api, compact, context, emit, sendUserMessage, getTool: (name = "self_compact") => tools.get(name), getCommand: (name: string) => commands.get(name) };
+  return {
+    api,
+    compact,
+    context,
+    emit,
+    sendUserMessage,
+    setContextUsage(tokens: number, contextWindow: number) { contextUsage = { tokens, contextWindow, percent: tokens / contextWindow }; },
+    getTool: (name = "self_compact") => tools.get(name),
+    getCommand: (name: string) => commands.get(name),
+  };
 }
 
 describe("Pi extension tracer", () => {
@@ -76,6 +87,25 @@ describe("Pi extension tracer", () => {
     test.emit("agent_settled", { type: "agent_settled" });
     expect(getContextLifecycleSnapshotV1().phase).toBe("idle");
     expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("arms, emits once, and rearms the high-context handoff watcher", () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+
+    test.setContextUsage(95, 100);
+    test.emit("turn_end", { type: "turn_end" });
+    test.emit("turn_end", { type: "turn_end" });
+    expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(test.sendUserMessage.mock.calls[0]?.[0]).toContain("durable handoff");
+    expect(test.sendUserMessage.mock.calls[0]?.[0]).toContain("self_compact");
+
+    test.setContextUsage(60, 100);
+    test.emit("turn_end", { type: "turn_end" });
+    test.setContextUsage(95, 100);
+    test.emit("turn_end", { type: "turn_end" });
+    expect(test.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
   it("routes both self-compact command aliases through one pending managed operation", async () => {

@@ -4,6 +4,25 @@ import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "./
 import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, publishContextLifecycleV1, repairContextLifecycleV1 } from "./registry.js";
 import type { RepairRequest } from "./types.js";
 
+const DEFAULT_HANDOFF_THRESHOLD = 0.94;
+const DEFAULT_HANDOFF_REARM_THRESHOLD = 0.65;
+
+function ratioFromEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const trimmed = value.trim();
+  const parsed = Number(trimmed.endsWith("%") ? Number(trimmed.slice(0, -1)) / 100 : trimmed);
+  return Number.isFinite(parsed) && parsed > 0 && parsed < 1 ? parsed : fallback;
+}
+
+function handoffInstruction(percent: number): string {
+  return [
+    `Context usage crossed the managed handoff threshold (${Math.round(percent * 1000) / 10}%).`,
+    "Finish the current safe work unit, write or update a durable handoff with repository state, validation, risks, and the exact next step, then call self_compact.",
+    "On resume, reload project instructions, the durable handoff, and active plan/status files before continuing.",
+    "Do not stop in the middle of a fragile operation, and do not use native manual /compact for this managed workflow.",
+  ].join("\n\n");
+}
+
 function textToolResult(text: string) {
   return { content: [{ type: "text" as const, text }], details: { disposition: text } };
 }
@@ -60,6 +79,9 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
   let generationId: string | undefined;
   let currentContext: ExtensionContext | undefined;
   let commandRequestSequence = 0;
+  let handoffWatcherArmed = true;
+  const handoffThreshold = ratioFromEnv(process.env.PI_CONTEXT_HANDOFF_THRESHOLD, DEFAULT_HANDOFF_THRESHOLD);
+  const handoffRearmThreshold = ratioFromEnv(process.env.PI_CONTEXT_HANDOFF_REARM_THRESHOLD, DEFAULT_HANDOFF_REARM_THRESHOLD);
 
   const adapter: ManagedCompactionAdapter = {
     compact(options) {
@@ -79,6 +101,24 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
   pi.on("agent_settled", (_event, ctx) => {
     currentContext = ctx;
     if (generationId) coordinator.onAgentSettled(generationId);
+  });
+
+  pi.on("turn_end", (_event, ctx) => {
+    currentContext = ctx;
+    const usage = ctx.getContextUsage();
+    if (usage === undefined || usage.tokens === null || usage.contextWindow <= 0) return;
+    const percent = usage.tokens / usage.contextWindow;
+    if (!handoffWatcherArmed) {
+      if (percent < handoffRearmThreshold) handoffWatcherArmed = true;
+      return;
+    }
+    if (percent < handoffThreshold || getContextLifecycleSnapshotV1().phase !== "idle") return;
+    try {
+      pi.sendUserMessage(handoffInstruction(percent), { deliverAs: "steer" });
+      handoffWatcherArmed = false;
+    } catch {
+      // Remain armed: a later settled turn may safely retry the advisory instruction.
+    }
   });
 
   pi.on("session_before_compact", (event, ctx) => {
