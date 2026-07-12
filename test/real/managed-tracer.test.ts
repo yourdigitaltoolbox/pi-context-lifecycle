@@ -12,7 +12,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import contextLifecycleExtension from "../../src/extension.js";
 import { createDeferredFakeProvider, createDisposableHarnessRoots, withDisposableHarnessEnvironment } from "../../src/testing/index.js";
-import { getContextLifecycleSnapshotV1 } from "../../src/registry.js";
+import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1 } from "../../src/registry.js";
 import { CONTEXT_LIFECYCLE_REGISTRY_SYMBOL } from "../../src/types.js";
 
 interface TimelineEvent { index: number; type: string; role?: string; entryType?: string }
@@ -21,6 +21,19 @@ function timelineRecord(event: AgentSessionEvent): Omit<TimelineEvent, "index"> 
   if (event.type === "message_start" || event.type === "message_end") return { type: event.type, role: event.message.role };
   if (event.type === "entry_appended") return { type: event.type, entryType: event.entry.type };
   return { type: event.type };
+}
+
+function textContent(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const text: string[] = [];
+  for (const block of content as unknown[]) {
+    if (typeof block !== "object" || block === null) return undefined;
+    const record = block as Record<string, unknown>;
+    if (record.type !== "text" || typeof record.text !== "string") return undefined;
+    text.push(record.text);
+  }
+  return text.join("");
 }
 
 describe("public SDK managed tracer", () => {
@@ -127,8 +140,15 @@ describe("public SDK managed tracer", () => {
       await awaitCall(turnSummary.call, "split-turn compaction provider call");
       turnSummary.release();
       await awaitCall(resumed.call, "resume provider call");
+      const resumedInvocation = await resumed.call;
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(timeline.filter((event) => event.type === "extension_session_compact"), JSON.stringify(timeline)).toHaveLength(1);
+      const compactionEnd = timeline.findIndex((event) => event.type === "compaction_end");
+      const resumeMessageStart = [...timeline].reverse().find((event) => event.type === "message_start" && event.role === "user")?.index ?? -1;
+      expect(compactionEnd).toBeGreaterThanOrEqual(0);
+      expect(compactionEnd).toBeLessThan(resumeMessageStart);
+      const resumedUserMessage = [...resumedInvocation.context.messages].reverse().find((message) => message.role === "user");
+      expect(textContent(resumedUserMessage?.content)).toMatch(/pi-context-lifecycle:v1 resume operationId=.+ generationId=.+/);
       resumed.release();
       await prompt;
       await twiceSettled;
@@ -150,6 +170,133 @@ describe("public SDK managed tracer", () => {
       unsubscribe();
       session.dispose();
     }
+      });
+    } finally {
+      await roots.cleanup();
+    }
+  });
+
+  it.each(["handled", "transformed", "unrelated"] as const)("does not admit a %s resume path without an exact user message_start", async (mode) => {
+    const roots = await createDisposableHarnessRoots();
+    try {
+      await withDisposableHarnessEnvironment(roots, async () => {
+        const provider = createDeferredFakeProvider();
+        const first = provider.enqueue(fauxAssistantMessage(fauxToolCall("self_compact", {}, { id: `self-compact-${mode}` }), { stopReason: "toolUse" }));
+        const second = provider.enqueue(fauxAssistantMessage("Ending the requesting run."));
+        const historySummary = provider.enqueue(fauxAssistantMessage("History summary."));
+        const turnSummary = provider.enqueue(fauxAssistantMessage("Turn summary."));
+        const adversarialResponse = mode === "handled" ? undefined : provider.enqueue(fauxAssistantMessage("Handled adversarial unrelated run."));
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_000 } });
+        const timeline: TimelineEvent[] = [];
+        const pushTimeline = (event: Omit<TimelineEvent, "index">): void => { timeline.push({ index: timeline.length, ...event }); };
+        const adversarialText = mode === "transformed" ? "unrelated transformed resume input" : "independent unrelated user input";
+        const adversaryExtension = (pi: ExtensionAPI) => {
+          pi.on("input", (event) => {
+            if (event.source !== "extension" || !event.text.includes("pi-context-lifecycle:v1 resume")) return;
+            if (mode === "handled" || mode === "unrelated") return { action: "handled" as const };
+            return { action: "transform" as const, text: adversarialText };
+          });
+          pi.on("message_start", (event) => {
+            if (event.message.role === "user" && textContent(event.message.content) === adversarialText) pushTimeline({ type: "adversarial_unrelated_user_message" });
+          });
+          pi.registerProvider(provider.provider, {
+            api: provider.api,
+            apiKey: "disposable-test-key",
+            baseUrl: "http://localhost.invalid",
+            models: provider.models.map((model) => ({
+              id: model.id,
+              name: model.name,
+              api: model.api,
+              reasoning: model.reasoning,
+              input: model.input,
+              cost: model.cost,
+              contextWindow: model.contextWindow,
+              maxTokens: model.maxTokens,
+            })),
+            streamSimple: (model, context, options) => provider.streamSimple(model, context, options),
+          });
+        };
+        const loader = new DefaultResourceLoader({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          settingsManager,
+          extensionFactories: [adversaryExtension, contextLifecycleExtension],
+        });
+        await loader.reload();
+        const sessionManager = SessionManager.create(roots.cwd, roots.sessions);
+        for (let index = 0; index < 5; index += 1) {
+          sessionManager.appendMessage({ role: "user", content: `history-${index} ${"u".repeat(4_000)}`, timestamp: Date.now() });
+          sessionManager.appendMessage(fauxAssistantMessage(`history-response-${index} ${"a".repeat(4_000)}`));
+        }
+        const { session } = await createAgentSession({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          sessionManager,
+          model: provider.getModel(),
+          tools: ["self_compact"],
+        });
+        await session.bindExtensions({ mode: "print" });
+        let settledCount = 0;
+        let finishCompaction!: () => void;
+        let settleTwice!: () => void;
+        const compactionFinished = new Promise<void>((resolve) => { finishCompaction = resolve; });
+        const twiceSettled = new Promise<void>((resolve) => { settleTwice = resolve; });
+        const unsubscribe = session.subscribe((event) => {
+          pushTimeline(timelineRecord(event));
+          if (event.type === "compaction_end") finishCompaction();
+          if (event.type === "agent_settled") {
+            settledCount += 1;
+            if (settledCount === 2) settleTwice();
+          }
+        });
+        const wait = async (promise: Promise<unknown>, label: string): Promise<void> => {
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            await Promise.race([
+              promise,
+              new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 5_000); }),
+            ]);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+        };
+        try {
+          const prompt = session.prompt(`Run the ${mode} resume scenario.`);
+          await wait(first.call, "initial call");
+          first.release();
+          await wait(second.call, "post-tool call");
+          second.release();
+          await wait(historySummary.call, "history summary");
+          historySummary.release();
+          await wait(turnSummary.call, "turn summary");
+          turnSummary.release();
+          await wait(compactionFinished, "compaction end");
+          await prompt;
+          if (adversarialResponse !== undefined) {
+            const unrelatedPrompt = mode === "unrelated" ? session.prompt(adversarialText) : undefined;
+            await wait(adversarialResponse.call, "adversarial unrelated run");
+            adversarialResponse.release();
+            if (unrelatedPrompt !== undefined) await unrelatedPrompt;
+            await wait(twiceSettled, "adversarial run settlement");
+          } else {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+          expect(getContextLifecycleSnapshotV1().phase).toBe("resuming");
+          expect(getContextLifecycleDiagnosticsV1().some((entry) => entry.code === "resume-message-matched")).toBe(false);
+          expect(timeline.filter((event) => event.type === "message_start" && event.role === "user")).toHaveLength(mode === "handled" ? 1 : 2);
+          expect(timeline.filter((event) => event.type === "agent_start")).toHaveLength(mode === "handled" ? 1 : 2);
+          expect(timeline.filter((event) => event.type === "adversarial_unrelated_user_message")).toHaveLength(mode === "handled" ? 0 : 1);
+          expect(provider.callCount).toBe(mode === "handled" ? 4 : 5);
+        } finally {
+          unsubscribe();
+          session.dispose();
+        }
       });
     } finally {
       await roots.cleanup();

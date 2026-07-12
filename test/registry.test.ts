@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { registryForHost } from "../src/registry.js";
-import type { CoordinatorPublisherV1 } from "../src/types.js";
+import type { CompactRequest, CoordinatorPublisherV1, WakeAdmission } from "../src/types.js";
 
 function publisher(): CoordinatorPublisherV1 {
   return {
@@ -70,23 +70,35 @@ describe("structural v1 registry", () => {
     expect(registry.diagnostics().some((entry) => entry.code === "listener-threw")).toBe(true);
   });
 
-  it("returns structured fail-closed dispositions while unavailable or incompatible", () => {
+  it("requires generation structurally before unavailable or incompatible authority", () => {
     const unavailable = registryForHost({});
-    expect(unavailable.requestCompaction({ requestId: "r", sessionId: "s", reason: "self" })).toEqual({ disposition: "rejected", code: "authority-unavailable" });
-    expect(unavailable.admitWake({ consumerId: "c", wakeId: "w", sessionId: "s" })).toEqual({ disposition: "reject", code: "authority-unavailable" });
+    const missingCompact = { requestId: "r", sessionId: "s", reason: "self" } as unknown as CompactRequest;
+    const missingWake = { consumerId: "c", wakeId: "w", sessionId: "s" } as unknown as WakeAdmission;
+    expect(unavailable.requestCompaction(missingCompact)).toEqual({ disposition: "rejected", code: "generation-required" });
+    expect(unavailable.admitWake(missingWake)).toEqual({ disposition: "reject", code: "generation-required" });
+    expect(unavailable.requestCompaction({ requestId: "r", sessionId: "s", generationId: "g", reason: "self" })).toEqual({ disposition: "rejected", code: "authority-unavailable" });
+    expect(unavailable.admitWake({ consumerId: "c", wakeId: "w", sessionId: "s", generationId: "g" })).toEqual({ disposition: "reject", code: "authority-unavailable" });
 
     const symbol = Symbol.for("yourdigitaltoolbox.pi-context-lifecycle.v1");
     const incompatible = registryForHost({ [symbol]: { protocolVersion: 2 } });
     expect(incompatible.snapshot().registryState).toBe("incompatible");
-    expect(incompatible.admitWake({ consumerId: "c", wakeId: "w", sessionId: "s" }).code).toBe("incompatible");
+    expect(incompatible.admitWake(missingWake).code).toBe("generation-required");
+    expect(incompatible.admitWake({ consumerId: "c", wakeId: "w", sessionId: "s", generationId: "g" }).code).toBe("incompatible");
   });
 
-  it("delegates synchronous admission without accepting a wake body", () => {
+  it("rejects mismatched generation structurally before synchronous delegation", () => {
     const admit = vi.fn(() => ({ disposition: "hold" as const, code: "active" }));
+    const compact = vi.fn(() => ({ disposition: "rejected" as const, code: "unused" }));
     const registry = registryForHost({});
-    registry.publish("owner", { ...publisher(), admitWake: admit }, { phase: "compacting" });
-    const result = registry.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session" });
+    registry.publish("owner", { ...publisher(), requestCompaction: compact, admitWake: admit }, { phase: "compacting", generationId: "generation", operationId: "operation" });
+    expect(registry.requestCompaction({ requestId: "request", sessionId: "session", generationId: "stale", reason: "remote" })).toEqual({ disposition: "rejected", code: "generation-mismatch", generationId: "generation" });
+    expect(registry.admitWake({ consumerId: "consumer", wakeId: "stale", sessionId: "session", generationId: "stale" })).toMatchObject({ disposition: "reject", code: "generation-mismatch", generationId: "generation" });
+    expect(compact).not.toHaveBeenCalled();
+    expect(admit).not.toHaveBeenCalled();
+
+    const admission = { consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: "generation" };
+    const result = registry.admitWake(admission);
     expect(result.disposition).toBe("hold");
-    expect(admit).toHaveBeenCalledWith({ consumerId: "consumer", wakeId: "wake", sessionId: "session" }, undefined);
+    expect(admit).toHaveBeenCalledWith(admission, undefined);
   });
 });

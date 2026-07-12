@@ -82,12 +82,16 @@ function createRegistry(): StructuralRegistryV1 {
       };
     },
     requestCompaction(request): CompactDisposition {
+      if (typeof request.generationId !== "string" || request.generationId.length === 0) return { disposition: "rejected", code: "generation-required" };
+      if (snapshot.generationId !== undefined && request.generationId !== snapshot.generationId) return { disposition: "rejected", code: "generation-mismatch", generationId: snapshot.generationId };
       if (!owner || snapshot.registryState !== "ready") {
         return { disposition: "rejected", code: snapshot.registryState === "incompatible" ? "incompatible" : "authority-unavailable", ...(snapshot.generationId === undefined ? {} : { generationId: snapshot.generationId }) };
       }
       return owner.publisher.requestCompaction(request);
     },
     admitWake(request, permit): WakeDisposition {
+      if (typeof request.generationId !== "string" || request.generationId.length === 0) return { disposition: "reject", code: "generation-required" };
+      if (snapshot.generationId !== undefined && request.generationId !== snapshot.generationId) return { disposition: "reject", code: "generation-mismatch", generationId: snapshot.generationId, ...(snapshot.phase === undefined ? {} : { phase: snapshot.phase }), ...(snapshot.operationId === undefined ? {} : { operationId: snapshot.operationId }) };
       if (!owner || snapshot.registryState !== "ready") {
         return { disposition: "reject", code: snapshot.registryState === "incompatible" ? "incompatible" : "authority-unavailable", ...(snapshot.phase === undefined ? {} : { phase: snapshot.phase }), ...(snapshot.generationId === undefined ? {} : { generationId: snapshot.generationId }) };
       }
@@ -172,8 +176,12 @@ export function registryForHost(host: RegistryHost): StructuralRegistryV1 {
     protocolVersion: 1,
     snapshot: () => cloneSnapshot(incompatibleSnapshot),
     observe: () => ({ snapshot: cloneSnapshot(incompatibleSnapshot), unsubscribe() { /* static incompatible authority */ } }),
-    requestCompaction: () => ({ disposition: "rejected", code: "incompatible" }),
-    admitWake: () => ({ disposition: "reject", code: "incompatible" }),
+    requestCompaction: (request) => typeof request.generationId !== "string" || request.generationId.length === 0
+      ? { disposition: "rejected", code: "generation-required" }
+      : { disposition: "rejected", code: "incompatible" },
+    admitWake: (request) => typeof request.generationId !== "string" || request.generationId.length === 0
+      ? { disposition: "reject", code: "generation-required" }
+      : { disposition: "reject", code: "incompatible" },
     registerDrainer: () => { throw new Error("Incompatible context lifecycle registry"); },
     diagnostics: () => [],
     publish: () => { throw new Error("Incompatible context lifecycle registry"); },

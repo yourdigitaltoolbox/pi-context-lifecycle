@@ -34,7 +34,7 @@ export interface LifecycleEvent extends Snapshot {
 export interface CompactRequest {
   requestId: string;
   sessionId: string;
-  generationId?: string;
+  generationId: string;
   reason: "self" | "remote";
   resume?: boolean;
   source?: string;
@@ -48,7 +48,7 @@ export interface WakeAdmission {
   consumerId: string;
   wakeId: string;
   sessionId: string;
-  generationId?: string;
+  generationId: string;
   source?: string;
 }
 

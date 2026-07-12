@@ -30,8 +30,9 @@ interface ActiveOperation {
   customInstructions: string;
   resumeMessage: string;
   compactStarted: boolean;
-  resumeInputObserved: boolean;
-  resumeAdmitted: boolean;
+  matchingManagedSuccessEvents: number;
+  managedCompleteObserved: boolean;
+  resumeMessageMatched: boolean;
 }
 
 interface RegisteredDrainer extends DrainerRegistration {
@@ -53,6 +54,23 @@ export const DEFAULT_RESUME_MESSAGE = [
 function withFocus(base: string, label: string, focus: string): string {
   const trimmed = focus.trim();
   return trimmed.length === 0 ? base : `${base}\n\n${label}: ${trimmed}`;
+}
+
+function markedResumeMessage(message: string, operationId: string, generationId: string): string {
+  return `${message}\n\n<!-- pi-context-lifecycle:v1 resume operationId=${operationId} generationId=${generationId} -->`;
+}
+
+function exactTextContent(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const text: string[] = [];
+  for (const block of content as unknown[]) {
+    if (typeof block !== "object" || block === null) return undefined;
+    const record = block as Record<string, unknown>;
+    if (record.type !== "text" || typeof record.text !== "string") return undefined;
+    text.push(record.text);
+  }
+  return text.join("");
 }
 
 export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
@@ -93,7 +111,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   }
 
   requestSelfCompaction(focus: string, requestId: string): CompactDisposition {
-    return this.request({ requestId, sessionId: this.sessionId ?? "", reason: "self", resume: true }, {
+    return this.request({ requestId, sessionId: this.sessionId ?? "", generationId: this.generationId ?? "", reason: "self", resume: true }, {
       customInstructions: withFocus(DEFAULT_COMPACTION_INSTRUCTIONS, "User focus for this compact/resume", focus),
       resumeMessage: withFocus(DEFAULT_RESUME_MESSAGE, "User focus", focus),
     });
@@ -107,25 +125,28 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   }
 
   private request(request: CompactRequest, content: { customInstructions: string; resumeMessage: string }): CompactDisposition {
+    if (typeof request.generationId !== "string" || request.generationId.length === 0) return { disposition: "rejected", code: "generation-required" };
     if (this.disposed || !this.sessionId || !this.generationId || !this.phase) return { disposition: "rejected", code: "session-unavailable" };
     if (request.sessionId !== this.sessionId) return { disposition: "rejected", code: "session-mismatch", generationId: this.generationId };
-    if (request.generationId !== undefined && request.generationId !== this.generationId) return { disposition: "rejected", code: "generation-mismatch", generationId: this.generationId };
+    if (request.generationId !== this.generationId) return { disposition: "rejected", code: "generation-mismatch", generationId: this.generationId };
     if (this.operation !== undefined) {
       if (request.resume === true || request.reason === "self") this.operation.resume = true;
       this.record("request-joined");
       return { disposition: "joined", operationId: this.operation.id, generationId: this.generationId };
     }
     if (this.phase !== "idle") return { disposition: "rejected", code: "not-idle", generationId: this.generationId };
+    const operationId = randomUUID();
     this.operation = {
-      id: randomUUID(),
+      id: operationId,
       reason: request.reason,
       startedAt: Date.now(),
       resume: request.resume === true || request.reason === "self",
       customInstructions: content.customInstructions,
-      resumeMessage: content.resumeMessage,
+      resumeMessage: markedResumeMessage(content.resumeMessage, operationId, this.generationId),
       compactStarted: false,
-      resumeInputObserved: false,
-      resumeAdmitted: false,
+      matchingManagedSuccessEvents: 0,
+      managedCompleteObserved: false,
+      resumeMessageMatched: false,
     };
     this.phase = "pending-settle";
     this.transition("request-accepted");
@@ -138,11 +159,39 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       this.startCompaction();
       return;
     }
-    if (this.phase === "resuming" && this.operation.resumeAdmitted) void this.release();
+    if (this.phase === "resuming" && this.operation.resumeMessageMatched) void this.release();
   }
 
-  onCompactionSuccess(generationId: string): void {
+  onSessionCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
     if (!this.isCurrentGeneration(generationId) || this.phase !== "compacting" || !this.operation) return;
+    if (reason !== "manual") {
+      this.record("non-managed-compaction-event-ignored");
+      return;
+    }
+    if (this.operation.managedCompleteObserved) {
+      this.record("late-manual-compaction-event-ignored");
+      return;
+    }
+    this.operation.matchingManagedSuccessEvents += 1;
+    this.record("managed-compaction-event-observed");
+    if (this.operation.matchingManagedSuccessEvents > 1) this.block("multiple-managed-compaction-events");
+  }
+
+  onManagedCompactionComplete(generationId: string, operationId: string): void {
+    if (!this.isCurrentGeneration(generationId) || this.phase !== "compacting" || !this.operation) return;
+    if (this.operation.id !== operationId) {
+      this.record("stale-operation-callback-dropped");
+      return;
+    }
+    this.operation.managedCompleteObserved = true;
+    if (this.operation.matchingManagedSuccessEvents === 0) {
+      this.block("managed-complete-without-success-event");
+      return;
+    }
+    if (this.operation.matchingManagedSuccessEvents !== 1) {
+      this.block("multiple-managed-compaction-events");
+      return;
+    }
     this.lastOutcome = "completed";
     if (!this.operation.resume) {
       void this.release();
@@ -154,22 +203,19 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.record("resume-sent");
   }
 
-  onInput(generationId: string, input: { source: string; text: string }): void {
+  onMessageStart(generationId: string, message: { role: string; content?: unknown }): void {
     if (!this.isCurrentGeneration(generationId) || this.phase !== "resuming" || !this.operation) return;
-    if (input.source === "extension" && input.text === this.operation.resumeMessage) this.operation.resumeInputObserved = true;
-  }
-
-  onAgentStart(generationId: string): void {
-    if (!this.isCurrentGeneration(generationId) || this.phase !== "resuming" || !this.operation?.resumeInputObserved) return;
-    this.operation.resumeAdmitted = true;
-    this.record("resume-admitted");
+    if (message.role !== "user" || exactTextContent(message.content) !== this.operation.resumeMessage) return;
+    this.operation.resumeMessageMatched = true;
+    this.record("resume-message-matched");
   }
 
   admitWake(request: WakeAdmission, permit?: ReleasePermit): WakeDisposition {
+    if (typeof request.generationId !== "string" || request.generationId.length === 0) return { disposition: "reject", code: "generation-required" };
     if (this.disposed || !this.sessionId || !this.generationId || !this.phase) return { disposition: "reject", code: "session-unavailable" };
     const identity = { phase: this.phase, generationId: this.generationId, ...(this.operation === undefined ? {} : { operationId: this.operation.id }) };
     if (request.sessionId !== this.sessionId) return { disposition: "reject", code: "session-mismatch", ...identity };
-    if (request.generationId !== undefined && request.generationId !== this.generationId) return { disposition: "reject", code: "generation-mismatch", ...identity };
+    if (request.generationId !== this.generationId) return { disposition: "reject", code: "generation-mismatch", ...identity };
     if (this.phase === "idle") return { disposition: "deliver", code: "idle", ...identity };
     if (this.phase === "releasing" && permit !== undefined && this.activePermits.has(permit) && permit.consumerId === request.consumerId && permit.sessionId === this.sessionId && permit.generationId === this.generationId && permit.operationId === this.operation?.id) {
       return { disposition: "deliver", code: "release-permit", ...identity };
@@ -212,9 +258,12 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.phase = "compacting";
     this.transition("compaction-started");
     const generation = this.generationId;
+    const operationId = this.operation.id;
     this.adapter.compact({
       customInstructions: this.operation.customInstructions,
-      onComplete: () => { /* session_compact is the durable success authority */ },
+      onComplete: () => {
+        if (generation !== undefined) this.onManagedCompactionComplete(generation, operationId);
+      },
       onError: () => {
         if (generation === this.generationId) this.record("compaction-error-observed");
       },
@@ -258,6 +307,12 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.operation = undefined;
     this.phase = "idle";
     this.transition("release-completed");
+  }
+
+  private block(code: string): void {
+    if (this.phase === "blocked-unknown") return;
+    this.phase = "blocked-unknown";
+    this.transition(code);
   }
 
   private isCurrentGeneration(generationId: string): boolean {
