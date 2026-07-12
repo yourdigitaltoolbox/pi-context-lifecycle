@@ -33,6 +33,7 @@
   },
   "scripts": {
     "clean": "rm -rf dist coverage test-results build-artifacts",
+    "prepare": "npm run build",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --coverage",
