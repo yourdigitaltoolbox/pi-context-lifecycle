@@ -116,6 +116,49 @@ describe("managed lifecycle coordinator", () => {
     expect(multiple.sendResume).not.toHaveBeenCalled();
   });
 
+  it("warns at two minutes and blocks at ten without unlocking managed compaction", () => {
+    vi.useFakeTimers();
+    try {
+      const test = setup();
+      test.coordinator.requestSelfCompaction("", "tool");
+      test.coordinator.onAgentSettled(test.generationId);
+
+      vi.advanceTimersByTime(119_999);
+      expect(test.coordinator.diagnostics().some((entry) => entry.code === "compaction-attention-warning")).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(test.registry.snapshot().phase).toBe("compacting");
+      expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "compaction-attention-warning", phase: "compacting" }));
+
+      vi.advanceTimersByTime(479_999);
+      expect(test.registry.snapshot().phase).toBe("compacting");
+      vi.advanceTimersByTime(1);
+      expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+      expect(test.sendResume).not.toHaveBeenCalled();
+      expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets late authoritative managed failure resolve the current compaction block", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = setup();
+      test.coordinator.requestSelfCompaction("", "tool");
+      test.coordinator.onAgentSettled(test.generationId);
+      vi.advanceTimersByTime(600_000);
+      expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+
+      test.compact.mock.calls[0]?.[0].onError(new Error("late provider rejection"));
+      await Promise.resolve();
+
+      expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "failed" });
+      expect(test.sendResume).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("releases the unchanged session after authoritative managed onError without resuming", async () => {
     const test = setup();
     test.coordinator.requestSelfCompaction("", "tool");
@@ -167,6 +210,45 @@ describe("managed lifecycle coordinator", () => {
     expect(test.coordinator.diagnostics().some((entry) => entry.code === "stale-generation-callback-dropped")).toBe(true);
   });
 
+  it("expires a drainer permit and blocks release at five seconds without accepting a late ack", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = setup();
+      let permit!: ReleasePermit;
+      let finish!: () => void;
+      const waiting = new Promise<void>((resolve) => { finish = resolve; });
+      test.coordinator.registerDrainer({
+        consumerId: "consumer",
+        priority: 1,
+        generationId: test.generationId,
+        async drain(value) {
+          permit = value;
+          await waiting;
+          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0 };
+        },
+      });
+      test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+      test.coordinator.onAgentSettled(test.generationId);
+      completeManagedCompaction(test);
+      expect(test.registry.snapshot().phase).toBe("releasing");
+
+      vi.advanceTimersByTime(4_999);
+      await Promise.resolve();
+      expect(test.registry.snapshot().phase).toBe("releasing");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+
+      const wake = { consumerId: "consumer", wakeId: "wake", sessionId: "session", generationId: test.generationId };
+      expect(test.coordinator.admitWake(wake, permit).disposition).toBe("hold");
+      finish();
+      await waiting;
+      await Promise.resolve();
+      expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("authorizes release by opaque permit identity, not copied fields", async () => {
     const test = setup();
     let permit!: ReleasePermit;
@@ -191,7 +273,7 @@ describe("managed lifecycle coordinator", () => {
     expect(test.coordinator.admitWake(wake, permit)).toMatchObject({ disposition: "deliver", code: "release-permit" });
     finish();
     await waiting;
-    await Promise.resolve();
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
     expect(test.coordinator.admitWake(wake, permit).code).toBe("idle");
   });
 
@@ -205,6 +287,31 @@ describe("managed lifecycle coordinator", () => {
     expect(encoded).not.toContain(secret);
     expect(encoded).not.toContain("mesh-body-123");
     expect(test.coordinator.diagnostics().length).toBeLessThanOrEqual(100);
+  });
+
+  it("warns at thirty seconds and blocks at sixty without resending an unobserved resume", () => {
+    vi.useFakeTimers();
+    try {
+      const test = setup();
+      test.coordinator.requestSelfCompaction("", "tool");
+      test.coordinator.onAgentSettled(test.generationId);
+      completeManagedCompaction(test);
+      expect(test.sendResume).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(29_999);
+      expect(test.coordinator.diagnostics().some((entry) => entry.code === "resume-admission-attention-warning")).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(test.registry.snapshot().phase).toBe("resuming");
+      expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "resume-admission-attention-warning", phase: "resuming" }));
+
+      vi.advanceTimersByTime(29_999);
+      expect(test.registry.snapshot().phase).toBe("resuming");
+      vi.advanceTimersByTime(1);
+      expect(test.registry.snapshot().phase).toBe("blocked-unknown");
+      expect(test.sendResume).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("abandons an ambiguous resume only through exact CAS repair without resending", async () => {
@@ -254,6 +361,39 @@ describe("managed lifecycle coordinator", () => {
       actor: "operator",
       channel: "command",
     }));
+  });
+
+  it("keeps a disposed generation inert when an old drainer deadline or ack arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      const test = setup();
+      let finish!: () => void;
+      const waiting = new Promise<void>((resolve) => { finish = resolve; });
+      test.coordinator.registerDrainer({
+        consumerId: "consumer",
+        priority: 1,
+        generationId: test.generationId,
+        async drain(value) {
+          await waiting;
+          return { releaseId: value.releaseId, consumerId: value.consumerId, disposition: "empty", submittedCount: 0 };
+        },
+      });
+      test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+      test.coordinator.onAgentSettled(test.generationId);
+      completeManagedCompaction(test);
+      expect(test.registry.snapshot().phase).toBe("releasing");
+
+      expect(test.coordinator.dispose()).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      finish();
+      await waiting;
+      await Promise.resolve();
+
+      expect(test.registry.snapshot().registryState).toBe("unavailable");
+      expect(test.coordinator.diagnostics().some((entry) => entry.code === "drainer-deadline" || entry.code === "release-completed")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("invalidates permits and callbacks on disposal", () => {

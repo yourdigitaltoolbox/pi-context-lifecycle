@@ -19,6 +19,11 @@ import type {
 import type { CoordinatorPublicationV1 } from "./registry.js";
 
 const MAX_DIAGNOSTICS = 100;
+const COMPACTION_WARNING_MS = 2 * 60 * 1000;
+const COMPACTION_BLOCK_MS = 10 * 60 * 1000;
+const RESUME_WARNING_MS = 30 * 1000;
+const RESUME_BLOCK_MS = 60 * 1000;
+const DRAINER_BLOCK_MS = 5 * 1000;
 
 export interface ManagedCompactionAdapter {
   compact(options: { customInstructions: string; onComplete(): void; onError(error: Error): void }): void;
@@ -93,6 +98,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private readonly records: DiagnosticRecord[] = [];
   private readonly drainers = new Map<string, RegisteredDrainer>();
   private readonly activePermits = new Set<ReleasePermit>();
+  private compactionWarningTimer: ReturnType<typeof setTimeout> | undefined;
+  private compactionBlockTimer: ReturnType<typeof setTimeout> | undefined;
+  private resumeWarningTimer: ReturnType<typeof setTimeout> | undefined;
+  private resumeBlockTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(ownerInstanceId: string = randomUUID()) {
     this.ownerInstanceId = ownerInstanceId;
@@ -199,6 +208,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     };
     this.phase = "observed-preflight";
     this.transition("automatic-compaction-preflight-observed");
+    this.scheduleCompactionDeadlines(this.operation.id);
   }
 
   onSessionCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): void {
@@ -208,6 +218,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         this.block("automatic-compaction-event-mismatch");
         return;
       }
+      this.clearCompactionDeadlines();
       this.lastOutcome = "completed";
       this.record("automatic-compaction-succeeded");
       void this.release();
@@ -238,6 +249,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       this.block("multiple-managed-compaction-events");
       return;
     }
+    this.clearCompactionDeadlines();
     this.lastOutcome = "completed";
     if (!this.operation.resume) {
       void this.release();
@@ -245,12 +257,15 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     }
     this.phase = "resuming";
     this.transition("compaction-succeeded");
+    this.scheduleResumeDeadlines(this.operation.id);
     this.adapter?.sendResume(this.operation.resumeMessage);
     this.record("resume-sent");
   }
 
   onManagedCompactionError(generationId: string, operationId: string): void {
-    if (!this.isCurrentGeneration(generationId) || this.phase !== "compacting" || !this.operation) return;
+    if (!this.isCurrentGeneration(generationId) || !this.operation) return;
+    const resolvesDeadlineBlock = this.phase === "blocked-unknown" && this.blockedReason === "compaction-deadline";
+    if (this.phase !== "compacting" && !resolvesDeadlineBlock) return;
     if (this.operation.id !== operationId) {
       this.record("stale-operation-callback-dropped");
       return;
@@ -259,15 +274,17 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       this.block("managed-error-after-success-event");
       return;
     }
+    this.clearCompactionDeadlines();
     this.lastOutcome = "failed";
-    this.record("managed-compaction-failed");
-    void this.release();
+    this.record(resolvesDeadlineBlock ? "late-managed-compaction-failure" : "managed-compaction-failed");
+    void this.release(resolvesDeadlineBlock);
   }
 
   onMessageStart(generationId: string, message: { role: string; content?: unknown }): void {
     if (!this.isCurrentGeneration(generationId) || this.phase !== "resuming" || !this.operation) return;
     if (message.role !== "user" || exactTextContent(message.content) !== this.operation.resumeMessage) return;
     this.operation.resumeMessageMatched = true;
+    this.clearResumeDeadlines();
     this.record("resume-message-matched");
   }
 
@@ -314,7 +331,6 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (request.generationId !== this.generationId) return reject("generation-mismatch");
     if (request.operationId !== this.operation.id) return reject("operation-mismatch");
     if (request.expectedPhase !== this.phase) return reject("phase-mismatch");
-    if (request.action !== "abandon-ambiguous-resume" || request.evidenceClass !== "current-process-quiescent") return reject("repair-evidence-insufficient");
     if (this.blockedReason !== "resume-admission-deadline" || !this.operation.resume || this.operation.resumeMessageMatched || this.lastOutcome !== "completed") return reject("repair-not-applicable");
 
     this.record("repair-applied", {
@@ -337,6 +353,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   dispose(): boolean {
     if (this.disposed) return false;
     this.disposed = true;
+    this.clearAllDeadlines();
     this.activePermits.clear();
     this.drainers.clear();
     this.phase = undefined;
@@ -353,6 +370,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.transition("compaction-started");
     const generation = this.generationId;
     const operationId = this.operation.id;
+    this.scheduleCompactionDeadlines(operationId);
     this.adapter.compact({
       customInstructions: this.operation.customInstructions,
       onComplete: () => {
@@ -366,6 +384,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
 
   private async release(fromBlockedRepair = false): Promise<void> {
     if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting" && this.phase !== "observed-preflight" && !(fromBlockedRepair && this.phase === "blocked-unknown"))) return;
+    this.clearAllDeadlines();
     this.blockedReason = undefined;
     this.phase = "releasing";
     this.transition("release-started");
@@ -382,15 +401,26 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         consumerId: drainer.consumerId,
       });
       this.activePermits.add(permit);
-      let ack: DrainAck;
+      let pendingAck: Promise<DrainAck> | DrainAck;
       try {
-        ack = await drainer.drain(permit);
+        pendingAck = drainer.drain(permit);
       } catch {
         this.activePermits.delete(permit);
         this.block("drainer-threw");
         return;
       }
+      const outcome = await this.waitForDrainer(pendingAck);
+      if (this.disposed || this.operation !== operation || drainer.generationId !== this.generationId) return;
       this.activePermits.delete(permit);
+      if (outcome.kind === "timeout") {
+        this.block("drainer-deadline");
+        return;
+      }
+      if (outcome.kind === "threw") {
+        this.block("drainer-threw");
+        return;
+      }
+      const ack = outcome.ack;
       if (ack.releaseId !== permit.releaseId || ack.consumerId !== permit.consumerId || ack.submittedCount < 0 || ack.disposition === "blocked") {
         this.block("drainer-blocked");
         return;
@@ -404,9 +434,74 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
 
   private block(code: string): void {
     if (this.phase === "blocked-unknown") return;
+    this.clearAllDeadlines();
     this.blockedReason = code;
     this.phase = "blocked-unknown";
     this.transition(code);
+  }
+
+  private async waitForDrainer(pendingAck: Promise<DrainAck> | DrainAck): Promise<{ kind: "ack"; ack: DrainAck } | { kind: "threw" } | { kind: "timeout" }> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const acknowledgement = Promise.resolve(pendingAck).then(
+      (ack) => ({ kind: "ack" as const, ack }),
+      () => ({ kind: "threw" as const }),
+    );
+    const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: "timeout" }), DRAINER_BLOCK_MS);
+      timer.unref();
+    });
+    const outcome = await Promise.race([acknowledgement, timeout]);
+    if (timer !== undefined) clearTimeout(timer);
+    return outcome;
+  }
+
+  private scheduleCompactionDeadlines(operationId: string): void {
+    this.clearCompactionDeadlines();
+    const generationId = this.generationId;
+    this.compactionWarningTimer = setTimeout(() => {
+      if (generationId !== undefined && this.isCurrentOperation(generationId, operationId, ["observed-preflight", "compacting"])) this.record("compaction-attention-warning");
+    }, COMPACTION_WARNING_MS);
+    this.compactionBlockTimer = setTimeout(() => {
+      if (generationId !== undefined && this.isCurrentOperation(generationId, operationId, ["observed-preflight", "compacting"])) this.block("compaction-deadline");
+    }, COMPACTION_BLOCK_MS);
+    this.compactionWarningTimer.unref();
+    this.compactionBlockTimer.unref();
+  }
+
+  private scheduleResumeDeadlines(operationId: string): void {
+    this.clearResumeDeadlines();
+    const generationId = this.generationId;
+    this.resumeWarningTimer = setTimeout(() => {
+      if (generationId !== undefined && this.isCurrentOperation(generationId, operationId, ["resuming"]) && this.operation !== undefined && !this.operation.resumeMessageMatched) this.record("resume-admission-attention-warning");
+    }, RESUME_WARNING_MS);
+    this.resumeBlockTimer = setTimeout(() => {
+      if (generationId !== undefined && this.isCurrentOperation(generationId, operationId, ["resuming"]) && this.operation !== undefined && !this.operation.resumeMessageMatched) this.block("resume-admission-deadline");
+    }, RESUME_BLOCK_MS);
+    this.resumeWarningTimer.unref();
+    this.resumeBlockTimer.unref();
+  }
+
+  private clearCompactionDeadlines(): void {
+    if (this.compactionWarningTimer !== undefined) clearTimeout(this.compactionWarningTimer);
+    if (this.compactionBlockTimer !== undefined) clearTimeout(this.compactionBlockTimer);
+    this.compactionWarningTimer = undefined;
+    this.compactionBlockTimer = undefined;
+  }
+
+  private clearResumeDeadlines(): void {
+    if (this.resumeWarningTimer !== undefined) clearTimeout(this.resumeWarningTimer);
+    if (this.resumeBlockTimer !== undefined) clearTimeout(this.resumeBlockTimer);
+    this.resumeWarningTimer = undefined;
+    this.resumeBlockTimer = undefined;
+  }
+
+  private clearAllDeadlines(): void {
+    this.clearCompactionDeadlines();
+    this.clearResumeDeadlines();
+  }
+
+  private isCurrentOperation(generationId: string, operationId: string, phases: Phase[]): boolean {
+    return !this.disposed && generationId === this.generationId && operationId === this.operation?.id && this.phase !== undefined && phases.includes(this.phase);
   }
 
   private isCurrentGeneration(generationId: string): boolean {
