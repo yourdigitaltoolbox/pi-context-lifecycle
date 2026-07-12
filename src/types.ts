@@ -27,6 +27,8 @@ export type LifecycleClaimState =
 
 export interface LifecycleClaim {
   schemaVersion: 1;
+  ownerInstanceId: string;
+  originOwnerInstanceId: string;
   operationId: string;
   sessionId: string;
   generationId: string;
@@ -106,7 +108,7 @@ export interface DrainerRegistration {
 }
 
 export type RepairAction = "abandon-ambiguous-resume";
-export type RepairEvidenceClass = "current-process-quiescent";
+export type RepairEvidenceClass = "current-process-quiescent" | "owner-process-replaced";
 export type RepairActor = "operator";
 export type RepairChannel = "command" | "remote";
 

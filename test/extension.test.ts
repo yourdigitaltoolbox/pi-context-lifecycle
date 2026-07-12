@@ -29,8 +29,9 @@ function harness() {
   } as unknown as ExtensionAPI;
   const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
   let contextUsage: { tokens: number; contextWindow: number; percent: number } | undefined;
+  let sessionEntries: unknown[] = [];
   const context = {
-    sessionManager: { getSessionId: () => "session" },
+    sessionManager: { getSessionId: () => "session", getEntries: () => sessionEntries },
     compact,
     getContextUsage: () => contextUsage,
   } as unknown as ExtensionContext;
@@ -43,6 +44,7 @@ function harness() {
     sendUserMessage,
     appendEntry,
     setContextUsage(tokens: number, contextWindow: number) { contextUsage = { tokens, contextWindow, percent: tokens / contextWindow }; },
+    setSessionEntries(entries: unknown[]) { sessionEntries = entries; },
     getTool: (name = "self_compact") => tools.get(name),
     getCommand: (name: string) => commands.get(name),
   };
@@ -172,43 +174,48 @@ describe("Pi extension tracer", () => {
     expect(kickoff.mock.calls[0]?.[0]).toContain("Run the next test.");
   });
 
-  it("applies an exact context-lifecycle repair from out-of-band command context", async () => {
-    vi.useFakeTimers();
-    try {
-      const test = harness();
-      contextLifecycleExtension(test.api);
-      test.emit("session_start", { type: "session_start", reason: "startup" });
-      await test.getTool()?.execute("tool-call", {});
-      test.emit("agent_settled", { type: "agent_settled" });
-      test.emit("session_compact", { type: "session_compact", reason: "manual", fromExtension: false });
-      test.compact.mock.calls[0]?.[0].onComplete();
-      await vi.advanceTimersByTimeAsync(60_000);
-      const blocked = getContextLifecycleSnapshotV1();
-      expect(blocked.phase).toBe("blocked-unknown");
+  it("restores and repairs an old-owner ambiguous resume only after process replacement", async () => {
+    const test = harness();
+    test.setSessionEntries([{
+      type: "custom",
+      customType: "pi-context-lifecycle",
+      data: {
+        schemaVersion: 1,
+        ownerInstanceId: "old-owner",
+        originOwnerInstanceId: "old-owner",
+        operationId: "old-operation",
+        sessionId: "session",
+        generationId: "old-generation",
+        state: "resume-admitting",
+        reason: "self",
+        timestamp: 1,
+      },
+    }]);
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "reload" });
+    const blocked = getContextLifecycleSnapshotV1();
+    expect(blocked).toMatchObject({ phase: "blocked-unknown", operationId: "old-operation" });
 
-      const notify = vi.fn();
-      const commandContext = { hasUI: true, ui: { notify } } as unknown as ExtensionCommandContext;
-      const command = test.getCommand("context-lifecycle");
-      expect(command).toBeDefined();
-      await command?.handler(`repair ${JSON.stringify({
-        action: "abandon-ambiguous-resume",
-        operationId: blocked.operationId,
-        sessionId: blocked.sessionId,
-        generationId: blocked.generationId,
-        expectedPhase: "blocked-unknown",
-        expectedSequence: blocked.sequence,
-        evidenceClass: "current-process-quiescent",
-        actor: "operator",
-        channel: "command",
-      })}`, commandContext);
+    const notify = vi.fn();
+    const commandContext = { hasUI: true, ui: { notify } } as unknown as ExtensionCommandContext;
+    const command = test.getCommand("context-lifecycle");
+    expect(command).toBeDefined();
+    await command?.handler(`repair ${JSON.stringify({
+      action: "abandon-ambiguous-resume",
+      operationId: blocked.operationId,
+      sessionId: blocked.sessionId,
+      generationId: blocked.generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "owner-process-replaced",
+      actor: "operator",
+      channel: "command",
+    })}`, commandContext);
 
-      await Promise.resolve();
-      expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
-      expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
-      expect(notify).toHaveBeenCalledWith(expect.stringContaining("applied"), "info");
-    } finally {
-      vi.useRealTimers();
-    }
+    await Promise.resolve();
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+    expect(test.sendUserMessage).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("applied"), "info");
   });
 
   it("rebinds a replacement session and keeps old-session callbacks and contexts inert", async () => {
@@ -224,7 +231,7 @@ describe("Pi extension tracer", () => {
     test.emit("session_shutdown", { type: "session_shutdown", reason: "new" });
     const newCompact = vi.fn<ManagedCompactionAdapter["compact"]>();
     const newContext = {
-      sessionManager: { getSessionId: () => "replacement-session" },
+      sessionManager: { getSessionId: () => "replacement-session", getEntries: () => [] },
       compact: newCompact,
       getContextUsage: () => undefined,
     } as unknown as ExtensionContext;

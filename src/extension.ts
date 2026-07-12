@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "./coordinator.js";
 import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, publishContextLifecycleV1, repairContextLifecycleV1 } from "./registry.js";
-import type { RepairRequest } from "./types.js";
+import type { CompactionReason, LifecycleClaim, LifecycleClaimState, RepairRequest } from "./types.js";
 
 const DEFAULT_HANDOFF_THRESHOLD = 0.94;
 const DEFAULT_HANDOFF_REARM_THRESHOLD = 0.65;
@@ -42,12 +42,37 @@ function parseHandoffArgs(args: string): { handoffPath: string; nextStep: string
   }
 }
 
+const CLAIM_STATES = new Set<LifecycleClaimState>(["requested", "compacting", "compacted", "resume-pending", "resume-admitting", "resume-admitted", "resume-settled", "released", "failed", "cancelled", "blocked-unknown"]);
+const COMPACTION_REASONS = new Set<CompactionReason>(["self", "remote", "builtin", "threshold", "overflow"]);
+
+function isLifecycleClaim(value: unknown): value is LifecycleClaim {
+  if (typeof value !== "object" || value === null) return false;
+  const claim = value as Partial<LifecycleClaim>;
+  return claim.schemaVersion === 1
+    && typeof claim.ownerInstanceId === "string" && claim.ownerInstanceId.length > 0
+    && typeof claim.originOwnerInstanceId === "string" && claim.originOwnerInstanceId.length > 0
+    && typeof claim.operationId === "string" && claim.operationId.length > 0
+    && typeof claim.sessionId === "string" && claim.sessionId.length > 0
+    && typeof claim.generationId === "string" && claim.generationId.length > 0
+    && typeof claim.state === "string" && CLAIM_STATES.has(claim.state)
+    && typeof claim.reason === "string" && COMPACTION_REASONS.has(claim.reason)
+    && typeof claim.timestamp === "number" && Number.isFinite(claim.timestamp);
+}
+
+function lifecycleClaims(ctx: ExtensionContext): LifecycleClaim[] {
+  const claims: LifecycleClaim[] = [];
+  for (const entry of ctx.sessionManager.getEntries()) {
+    if (entry.type === "custom" && entry.customType === "pi-context-lifecycle" && isLifecycleClaim(entry.data)) claims.push(entry.data);
+  }
+  return claims;
+}
+
 function parseRepairRequest(value: string): RepairRequest | undefined {
   try {
     const request = JSON.parse(value) as Record<string, unknown>;
     if (request.action !== "abandon-ambiguous-resume"
       || request.expectedPhase !== "blocked-unknown"
-      || request.evidenceClass !== "current-process-quiescent"
+      || (request.evidenceClass !== "current-process-quiescent" && request.evidenceClass !== "owner-process-replaced")
       || request.actor !== "operator"
       || (request.channel !== "command" && request.channel !== "remote")
       || typeof request.operationId !== "string" || request.operationId.length === 0
@@ -109,6 +134,7 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
       },
     };
     binding.generationId = next.bindSession(binding.sessionId, adapter);
+    next.restoreClaims(lifecycleClaims(ctx));
     coordinator = next;
     activeBinding = binding;
   });

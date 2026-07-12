@@ -314,7 +314,7 @@ describe("managed lifecycle coordinator", () => {
     }
   });
 
-  it("abandons an ambiguous resume only through exact CAS repair without resending", async () => {
+  it("rejects caller-asserted quiescence for an ambiguous resume in the current owner process", async () => {
     const test = setup();
     const accepted = test.coordinator.requestSelfCompaction("", "tool");
     test.coordinator.onAgentSettled(test.generationId);
@@ -349,17 +349,55 @@ describe("managed lifecycle coordinator", () => {
       evidenceClass: "current-process-quiescent",
       actor: "operator",
       channel: "command",
+    })).toMatchObject({ disposition: "rejected", code: "repair-not-applicable" });
+    await Promise.resolve();
+
+    expect(test.registry.snapshot()).toMatchObject({ phase: "blocked-unknown", lastOutcome: "completed" });
+    expect(test.sendResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores an ambiguous old-owner resume claim and abandons it without resend by exact CAS repair", async () => {
+    const registry = registryForHost({});
+    const coordinator = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
+    const sendResume = vi.fn<ManagedCompactionAdapter["sendResume"]>();
+    const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
+    coordinator.attachPublication(publication);
+    const generationId = coordinator.bindSession("session", { compact, sendResume });
+    coordinator.restoreClaims([{
+      schemaVersion: 1,
+      ownerInstanceId: "old-owner",
+      originOwnerInstanceId: "old-owner",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId: "old-generation",
+      state: "resume-admitting",
+      reason: "self",
+      timestamp: 1,
+    }]);
+    const blocked = registry.snapshot();
+    expect(blocked).toMatchObject({ phase: "blocked-unknown", operationId: "old-operation", generationId });
+
+    expect(registry.repair({
+      action: "abandon-ambiguous-resume",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "owner-process-replaced",
+      actor: "operator",
+      channel: "command",
     })).toMatchObject({ disposition: "applied", action: "abandon-ambiguous-resume" });
     await Promise.resolve();
 
-    expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
-    expect(test.sendResume).toHaveBeenCalledTimes(1);
-    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({
+    expect(registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+    expect(sendResume).not.toHaveBeenCalled();
+    expect(coordinator.diagnostics()).toContainEqual(expect.objectContaining({
       code: "repair-applied",
-      action: "abandon-ambiguous-resume",
-      evidenceClass: "current-process-quiescent",
-      actor: "operator",
-      channel: "command",
+      evidenceClass: "owner-process-replaced",
+      priorPhase: "blocked-unknown",
+      newPhase: "releasing",
     }));
   });
 

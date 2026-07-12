@@ -37,6 +37,7 @@ interface ActiveOperation {
   id: string;
   reason: CompactionReason;
   managed: boolean;
+  originOwnerInstanceId: string;
   startedAt: number;
   resume: boolean;
   customInstructions: string;
@@ -127,6 +128,30 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     return this.generationId;
   }
 
+  restoreClaims(claims: readonly LifecycleClaim[]): void {
+    if (this.disposed || !this.sessionId || !this.generationId || this.phase !== "idle" || this.operation !== undefined) throw new Error("Coordinator cannot restore claims in the current state");
+    const latest = [...claims].reverse().find((claim) => claim.sessionId === this.sessionId);
+    if (latest === undefined || latest.state === "released" || latest.state === "failed" || latest.state === "cancelled") return;
+    this.operation = {
+      id: latest.operationId,
+      reason: latest.reason,
+      managed: latest.reason === "self" || latest.reason === "remote",
+      originOwnerInstanceId: latest.originOwnerInstanceId,
+      startedAt: latest.timestamp,
+      resume: latest.state.startsWith("resume-") || latest.reason === "self",
+      customInstructions: "",
+      resumeMessage: "",
+      compactStarted: latest.state !== "requested",
+      matchingManagedSuccessEvents: 0,
+      managedCompleteObserved: latest.state !== "requested" && latest.state !== "compacting",
+      resumeMessageMatched: latest.state === "resume-admitted" || latest.state === "resume-settled",
+    };
+    if (latest.state === "compacted" || latest.state.startsWith("resume-") || latest.state === "blocked-unknown") this.lastOutcome = "completed";
+    this.blockedReason = `restored-${latest.state}`;
+    this.phase = "blocked-unknown";
+    this.transition("operation-restored-blocked");
+  }
+
   requestSelfCompaction(focus: string, requestId: string): CompactDisposition {
     return this.request({ requestId, sessionId: this.sessionId ?? "", generationId: this.generationId ?? "", reason: "self", resume: true }, {
       customInstructions: withFocus(DEFAULT_COMPACTION_INSTRUCTIONS, "User focus for this compact/resume", focus),
@@ -163,6 +188,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       id: operationId,
       reason: request.reason,
       managed: true,
+      originOwnerInstanceId: this.ownerInstanceId,
       startedAt: Date.now(),
       resume: request.resume === true || request.reason === "self",
       customInstructions: content.customInstructions,
@@ -217,6 +243,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       id: randomUUID(),
       reason,
       managed: false,
+      originOwnerInstanceId: this.ownerInstanceId,
       startedAt: Date.now(),
       resume: false,
       customInstructions: "",
@@ -375,7 +402,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (request.generationId !== this.generationId) return reject("generation-mismatch");
     if (request.operationId !== this.operation.id) return reject("operation-mismatch");
     if (request.expectedPhase !== this.phase) return reject("phase-mismatch");
-    if (this.blockedReason !== "resume-admission-deadline" || !this.operation.resume || this.operation.resumeMessageMatched || this.lastOutcome !== "completed") return reject("repair-not-applicable");
+    const oldOwnerCannotExecute = this.operation.originOwnerInstanceId !== this.ownerInstanceId
+      && this.blockedReason === "restored-resume-admitting"
+      && request.evidenceClass === "owner-process-replaced";
+    if (!oldOwnerCannotExecute || !this.operation.resume || this.operation.resumeMessageMatched || this.lastOutcome !== "completed") return reject("repair-not-applicable");
 
     this.record("repair-applied", {
       action: request.action,
@@ -498,6 +528,8 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     try {
       this.adapter?.appendLifecycleEntry?.({
         schemaVersion: 1,
+        ownerInstanceId: this.ownerInstanceId,
+        originOwnerInstanceId: this.operation.originOwnerInstanceId,
         operationId: this.operation.id,
         sessionId: this.sessionId,
         generationId: this.generationId,
