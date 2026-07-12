@@ -87,6 +87,30 @@ describe("structural v1 registry", () => {
     expect(incompatible.admitWake({ consumerId: "c", wakeId: "w", sessionId: "s", generationId: "g" }).code).toBe("incompatible");
   });
 
+  it("rejects stale repair generation, sequence, and operation before delegation", () => {
+    const repair = vi.fn(() => ({ disposition: "applied" as const, action: "abandon-ambiguous-resume" as const, operationId: "operation", generationId: "generation" }));
+    const registry = registryForHost({});
+    registry.publish("owner", { ...publisher(), repair }, { sessionId: "session", generationId: "generation", phase: "blocked-unknown", operationId: "operation" });
+    const sequence = registry.snapshot().sequence;
+    const request = {
+      action: "abandon-ambiguous-resume" as const,
+      operationId: "operation",
+      sessionId: "session",
+      generationId: "generation",
+      expectedPhase: "blocked-unknown" as const,
+      expectedSequence: sequence,
+      evidenceClass: "current-process-quiescent" as const,
+      actor: "operator" as const,
+      channel: "command" as const,
+    };
+
+    expect(registry.repair({ ...request, generationId: "stale" })).toMatchObject({ disposition: "rejected", code: "generation-mismatch", sequence });
+    expect(registry.repair({ ...request, expectedSequence: sequence - 1 })).toMatchObject({ disposition: "rejected", code: "snapshot-sequence-mismatch", sequence });
+    expect(registry.repair({ ...request, operationId: "stale" })).toMatchObject({ disposition: "rejected", code: "operation-mismatch", sequence });
+    expect(registry.repair({ ...request, expectedPhase: "blocked-unknown", expectedSequence: sequence })).toMatchObject({ disposition: "applied" });
+    expect(repair).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects mismatched generation structurally before synchronous delegation", () => {
     const admit = vi.fn(() => ({ disposition: "hold" as const, code: "active" }));
     const compact = vi.fn(() => ({ disposition: "rejected" as const, code: "unused" }));

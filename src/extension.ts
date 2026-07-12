@@ -1,10 +1,56 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "./coordinator.js";
-import { publishContextLifecycleV1 } from "./registry.js";
+import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, publishContextLifecycleV1, repairContextLifecycleV1 } from "./registry.js";
+import type { RepairRequest } from "./types.js";
 
 function textToolResult(text: string) {
   return { content: [{ type: "text" as const, text }], details: { disposition: text } };
+}
+
+function parseHandoffArgs(args: string): { handoffPath: string; nextStep: string } {
+  const fallback = { handoffPath: "HANDOFF.md", nextStep: "Continue from the next step recorded in the handoff." };
+  const trimmed = args.trim();
+  if (trimmed.length === 0) return fallback;
+  try {
+    const parsed = JSON.parse(trimmed) as { handoffPath?: unknown; nextStep?: unknown };
+    return {
+      handoffPath: typeof parsed.handoffPath === "string" && parsed.handoffPath.trim().length > 0 ? parsed.handoffPath.trim() : fallback.handoffPath,
+      nextStep: typeof parsed.nextStep === "string" && parsed.nextStep.trim().length > 0 ? parsed.nextStep.trim() : fallback.nextStep,
+    };
+  } catch {
+    return { ...fallback, handoffPath: trimmed };
+  }
+}
+
+function parseRepairRequest(value: string): RepairRequest | undefined {
+  try {
+    const request = JSON.parse(value) as Record<string, unknown>;
+    if (request.action !== "abandon-ambiguous-resume"
+      || request.expectedPhase !== "blocked-unknown"
+      || request.evidenceClass !== "current-process-quiescent"
+      || request.actor !== "operator"
+      || (request.channel !== "command" && request.channel !== "remote")
+      || typeof request.operationId !== "string" || request.operationId.length === 0
+      || typeof request.sessionId !== "string" || request.sessionId.length === 0
+      || typeof request.generationId !== "string" || request.generationId.length === 0
+      || typeof request.expectedSequence !== "number" || !Number.isSafeInteger(request.expectedSequence) || request.expectedSequence < 0) return undefined;
+    return request as unknown as RepairRequest;
+  } catch {
+    return undefined;
+  }
+}
+
+function handoffKickoff(handoffPath: string, nextStep: string): string {
+  return [
+    "This is a fresh continuation session created from a durable handoff.",
+    "Rebuild working context before doing more work:",
+    "1. Read AGENTS.md/project instructions for this cwd.",
+    `2. Read ${handoffPath}.`,
+    "3. Read any active plan/status file referenced by the handoff.",
+    `4. Continue with this next step: ${nextStep}`,
+    "Treat durable project files as source of truth rather than previous chat history.",
+  ].join("\n");
 }
 
 export default function contextLifecycleExtension(pi: ExtensionAPI): void {
@@ -13,6 +59,7 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
   coordinator.attachPublication(publication);
   let generationId: string | undefined;
   let currentContext: ExtensionContext | undefined;
+  let commandRequestSequence = 0;
 
   const adapter: ManagedCompactionAdapter = {
     compact(options) {
@@ -53,6 +100,78 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
     generationId = undefined;
     currentContext = undefined;
     coordinator.dispose();
+  });
+
+  pi.registerCommand("context-lifecycle", {
+    description: "Show redacted lifecycle status or apply an exact compare-and-swap repair.",
+    handler: (args, ctx) => {
+      const trimmed = args.trim();
+      if (trimmed === "status" || trimmed.length === 0) {
+        const status = {
+          snapshot: getContextLifecycleSnapshotV1(),
+          diagnostics: getContextLifecycleDiagnosticsV1().slice(-10),
+        };
+        if (ctx.hasUI) ctx.ui.notify(`Context lifecycle status: ${JSON.stringify(status)}`, "info");
+        return Promise.resolve();
+      }
+      if (!trimmed.startsWith("repair ")) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /context-lifecycle status | repair <exact-json-request>", "warning");
+        return Promise.resolve();
+      }
+      const request = parseRepairRequest(trimmed.slice("repair ".length));
+      if (request === undefined) {
+        if (ctx.hasUI) ctx.ui.notify("Context lifecycle repair rejected: invalid or incomplete request.", "error");
+        return Promise.resolve();
+      }
+      const disposition = repairContextLifecycleV1(request);
+      if (ctx.hasUI) ctx.ui.notify(`Context lifecycle repair ${disposition.disposition}${disposition.disposition === "rejected" ? ` (${disposition.code})` : ` (${disposition.action})`}.`, disposition.disposition === "applied" ? "info" : "warning");
+      return Promise.resolve();
+    },
+  });
+
+  for (const commandName of ["self_compact", "self-compact"] as const) {
+    pi.registerCommand(commandName, {
+      description: "Request managed context compaction and one correlated resume turn.",
+      handler: (args, ctx) => {
+        currentContext = ctx;
+        const disposition = coordinator.requestSelfCompactionFromCommand(args, `command:${commandName}:${++commandRequestSequence}`);
+        if (ctx.hasUI) {
+          const level = disposition.disposition === "rejected" ? "warning" : "info";
+          ctx.ui.notify(`Self compact ${disposition.disposition}${disposition.disposition === "rejected" ? ` (${disposition.code})` : ` as ${disposition.operationId}`}.`, level);
+        }
+        return Promise.resolve();
+      },
+    });
+  }
+
+  pi.registerTool({
+    name: "handoff_new_session",
+    label: "Handoff New Session",
+    description: "Validate fresh-session handoff intent and return the command that must be invoked from user command context.",
+    parameters: Type.Object({
+      handoffPath: Type.Optional(Type.String({ maxLength: 4096, description: "Path to the durable handoff file." })),
+      nextStep: Type.Optional(Type.String({ maxLength: 2000, description: "Exact next step for the replacement session." })),
+    }),
+    execute(_toolCallId, params) {
+      const handoff = parseHandoffArgs(JSON.stringify(params));
+      const command = `/handoff-new-session ${JSON.stringify(handoff)}`;
+      return Promise.resolve(textToolResult(`Pi 0.80.6 permits session replacement only from command context. Invoke this command after the current turn settles; no slash-command text was queued automatically:\n${command}`));
+    },
+  });
+
+  pi.registerCommand("handoff-new-session", {
+    description: "Start one fresh session and continue from a durable handoff file.",
+    handler: async (args, ctx) => {
+      const handoff = parseHandoffArgs(args);
+      const parentSession = ctx.sessionManager.getSessionFile();
+      const result = await ctx.newSession({
+        ...(parentSession === undefined ? {} : { parentSession }),
+        withSession: async (newCtx) => {
+          await newCtx.sendUserMessage(handoffKickoff(handoff.handoffPath, handoff.nextStep));
+        },
+      });
+      if (result.cancelled && ctx.hasUI) ctx.ui.notify("Fresh handoff session was cancelled; the current session remains active.", "warning");
+    },
   });
 
   pi.registerTool({

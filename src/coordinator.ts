@@ -131,6 +131,12 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     });
   }
 
+  requestSelfCompactionFromCommand(focus: string, requestId: string): CompactDisposition {
+    const disposition = this.requestSelfCompaction(focus, requestId);
+    if (disposition.disposition === "accepted") this.startCompaction();
+    return disposition;
+  }
+
   requestCompaction(request: CompactRequest): CompactDisposition {
     return this.request(request, {
       customInstructions: DEFAULT_COMPACTION_INSTRUCTIONS,
