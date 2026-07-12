@@ -3,8 +3,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createDisposableHarnessRoots, runPackagedImportSmoke, withDisposableHarnessEnvironment } from "../dist/testing/index.js";
+type TestingModule = typeof import("../src/testing/index.js");
 
+const testing = await import(new URL("../dist/testing/index.js", import.meta.url).href) as TestingModule;
+const { createDisposableHarnessRoots, runPackagedImportSmoke, withDisposableHarnessEnvironment } = testing;
 const execFileAsync = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const roots = await createDisposableHarnessRoots("pi-context-lifecycle-packaged-");

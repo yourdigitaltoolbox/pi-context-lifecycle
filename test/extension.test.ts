@@ -188,6 +188,7 @@ describe("Pi extension tracer", () => {
         generationId: "old-generation",
         state: "resume-admitting",
         reason: "self",
+        resumeIntent: true,
         timestamp: 1,
       },
     }]);

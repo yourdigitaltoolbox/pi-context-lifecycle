@@ -1,17 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "../src/coordinator.js";
 import { registryForHost } from "../src/registry.js";
-import type { CompactRequest, ReleasePermit, WakeAdmission } from "../src/types.js";
+import type { CompactRequest, LifecycleClaim, ReleasePermit, WakeAdmission } from "../src/types.js";
 
 function setup() {
   const registry = registryForHost({});
   const coordinator = new ContextLifecycleCoordinatorV1("owner");
   const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
   const sendResume = vi.fn<ManagedCompactionAdapter["sendResume"]>();
+  const appendLifecycleEntry = vi.fn<(claim: LifecycleClaim) => void>();
   const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
   coordinator.attachPublication(publication);
-  const generationId = coordinator.bindSession("session", { compact, sendResume });
-  return { registry, coordinator, compact, sendResume, generationId };
+  const generationId = coordinator.bindSession("session", { compact, sendResume, appendLifecycleEntry });
+  return { registry, coordinator, compact, sendResume, appendLifecycleEntry, generationId };
 }
 
 function completeManagedCompaction(test: ReturnType<typeof setup>): void {
@@ -249,16 +250,30 @@ describe("managed lifecycle coordinator", () => {
     expect(test.coordinator.admitWake({ consumerId: "consumer", wakeId: "stale", sessionId: "session", generationId: "stale" })).toMatchObject({ disposition: "reject", code: "generation-mismatch", generationId: test.generationId });
   });
 
-  it("joins duplicate self requests and rejects stale callback generations", () => {
+  it("durably merges joined resume intent and safe pre-compaction focus", () => {
     const test = setup();
-    const first = test.coordinator.requestSelfCompaction("", "tool-1");
-    const second = test.coordinator.requestSelfCompaction("ignored later focus", "tool-2");
+    const first = test.coordinator.requestCompaction({ requestId: "remote-1", sessionId: "session", generationId: test.generationId, reason: "remote", resume: false });
+    const second = test.coordinator.requestSelfCompaction("joined focus from self", "tool-2");
     expect(second).toMatchObject({ disposition: "joined", operationId: first.disposition === "accepted" ? first.operationId : "" });
+    expect(test.appendLifecycleEntry).toHaveBeenCalledTimes(2);
+    expect(test.appendLifecycleEntry.mock.calls[0]?.[0]).toMatchObject({ state: "requested", reason: "remote", resumeIntent: false });
+    expect(test.appendLifecycleEntry.mock.calls[1]?.[0]).toMatchObject({ state: "requested", reason: "remote", resumeIntent: true });
+    expect(JSON.stringify(test.appendLifecycleEntry.mock.calls)).not.toContain("joined focus from self");
+
     test.coordinator.onAgentSettled("stale-generation");
     expect(test.compact).not.toHaveBeenCalled();
     test.coordinator.onAgentSettled(test.generationId);
     expect(test.compact).toHaveBeenCalledTimes(1);
+    expect(test.compact.mock.calls[0]?.[0].customInstructions).toContain("joined focus from self");
     expect(test.coordinator.diagnostics().some((entry) => entry.code === "stale-generation-callback-dropped")).toBe(true);
+
+    const restoredRegistry = registryForHost({});
+    const restored = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const publication = restoredRegistry.publish(restored.ownerInstanceId, restored, {});
+    restored.attachPublication(publication);
+    restored.bindSession("session", { compact: vi.fn(), sendResume: vi.fn() });
+    restored.restoreClaims(test.appendLifecycleEntry.mock.calls.map(([claim]) => claim));
+    expect(restoredRegistry.snapshot()).toMatchObject({ phase: "blocked-unknown", operationId: first.disposition === "accepted" ? first.operationId : "", reason: "remote", resumeIntent: true });
   });
 
   it("expires a drainer permit and blocks release at five seconds without accepting a late ack", async () => {
@@ -505,6 +520,7 @@ describe("managed lifecycle coordinator", () => {
       generationId: "old-generation",
       state,
       reason: "self",
+      resumeIntent: true,
       timestamp: 1,
     }]);
 
@@ -527,6 +543,7 @@ describe("managed lifecycle coordinator", () => {
       generationId: "old-generation",
       state,
       reason: "self",
+      resumeIntent: true,
       timestamp: 1,
     }]);
 
@@ -551,6 +568,7 @@ describe("managed lifecycle coordinator", () => {
       generationId: "old-generation",
       state: "resume-admitting",
       reason: "self",
+      resumeIntent: true,
       timestamp: 1,
     }]);
     const blocked = registry.snapshot();
@@ -598,6 +616,7 @@ describe("managed lifecycle coordinator", () => {
       generationId: "old-generation",
       state: "resume-admitting",
       reason: "self",
+      resumeIntent: true,
       timestamp: 1,
     }]);
     const blocked = registry.snapshot();
@@ -639,6 +658,7 @@ describe("managed lifecycle coordinator", () => {
       generationId: "old-generation",
       state: "resume-pending",
       reason: "self",
+      resumeIntent: true,
       timestamp: 1,
     }]);
     const blocked = registry.snapshot();
@@ -691,6 +711,7 @@ describe("managed lifecycle coordinator", () => {
       generationId: "old-generation",
       state: "requested",
       reason: "self",
+      resumeIntent: true,
       timestamp: 1,
     }]);
     const blocked = registry.snapshot();

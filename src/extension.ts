@@ -56,6 +56,7 @@ function isLifecycleClaim(value: unknown): value is LifecycleClaim {
     && typeof claim.generationId === "string" && claim.generationId.length > 0
     && typeof claim.state === "string" && CLAIM_STATES.has(claim.state)
     && typeof claim.reason === "string" && COMPACTION_REASONS.has(claim.reason)
+    && typeof claim.resumeIntent === "boolean"
     && typeof claim.timestamp === "number" && Number.isFinite(claim.timestamp);
 }
 

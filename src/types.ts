@@ -34,6 +34,7 @@ export interface LifecycleClaim {
   generationId: string;
   state: LifecycleClaimState;
   reason: CompactionReason;
+  resumeIntent: boolean;
   timestamp: number;
 }
 
@@ -47,6 +48,7 @@ export interface Snapshot {
   phase?: Phase;
   operationId?: string;
   reason?: CompactionReason;
+  resumeIntent?: boolean;
   startedAt?: number;
   lastOutcome?: OperationOutcome;
 }

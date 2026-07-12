@@ -40,6 +40,7 @@ interface ActiveOperation {
   reason: CompactionReason;
   managed: boolean;
   originOwnerInstanceId: string;
+  claimState: LifecycleClaimState;
   startedAt: number;
   resume: boolean;
   customInstructions: string;
@@ -147,8 +148,9 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       reason: latest.reason,
       managed: latest.reason === "self" || latest.reason === "remote",
       originOwnerInstanceId: latest.originOwnerInstanceId,
+      claimState: latest.state,
       startedAt: latest.timestamp,
-      resume: latest.state.startsWith("resume-") || latest.reason === "self",
+      resume: latest.resumeIntent,
       customInstructions: "",
       resumeMessage: markedResumeMessage(DEFAULT_RESUME_MESSAGE, latest.operationId, this.generationId),
       compactStarted: latest.state !== "requested",
@@ -188,8 +190,19 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (request.sessionId !== this.sessionId) return { disposition: "rejected", code: "session-mismatch", generationId: this.generationId };
     if (request.generationId !== this.generationId) return { disposition: "rejected", code: "generation-mismatch", generationId: this.generationId };
     if (this.operation !== undefined) {
-      if (request.resume === true || request.reason === "self") this.operation.resume = true;
-      this.record("request-joined");
+      if (!this.operation.managed) return { disposition: "rejected", code: "automatic-compaction-active", generationId: this.generationId };
+      if (this.phase !== "pending-settle" && this.phase !== "compacting" && this.phase !== "resuming") return { disposition: "rejected", code: "operation-not-joinable", generationId: this.generationId };
+      const addsResumeIntent = !this.operation.resume && (request.resume === true || request.reason === "self");
+      if (request.resume === true || request.reason === "self") {
+        this.operation.resume = true;
+        this.operation.resumeMessage = markedResumeMessage(content.resumeMessage, this.operation.id, this.generationId);
+        if (!this.operation.compactStarted) this.operation.customInstructions = content.customInstructions;
+      }
+      if (addsResumeIntent && !this.persistClaim(this.operation.claimState)) {
+        this.block("claim-persist-failed", false);
+        return { disposition: "rejected", code: "claim-persist-failed", generationId: this.generationId };
+      }
+      this.record(addsResumeIntent ? "request-joined-resume-intent" : "request-joined");
       return { disposition: "joined", operationId: this.operation.id, generationId: this.generationId };
     }
     if (this.phase !== "idle") return { disposition: "rejected", code: "not-idle", generationId: this.generationId };
@@ -199,6 +212,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       reason: request.reason,
       managed: true,
       originOwnerInstanceId: this.ownerInstanceId,
+      claimState: "requested",
       startedAt: Date.now(),
       resume: request.resume === true || request.reason === "self",
       customInstructions: content.customInstructions,
@@ -258,6 +272,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       reason: observedReason,
       managed: false,
       originOwnerInstanceId: this.ownerInstanceId,
+      claimState: "compacting",
       startedAt: Date.now(),
       resume: false,
       customInstructions: "",
@@ -686,8 +701,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         generationId: this.generationId,
         state,
         reason: this.operation.reason,
+        resumeIntent: this.operation.resume,
         timestamp: Date.now(),
       });
+      this.operation.claimState = state;
       return true;
     } catch {
       this.record("claim-persist-error");
@@ -770,7 +787,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       ...(this.sessionId === undefined ? {} : { sessionId: this.sessionId }),
       ...(this.generationId === undefined ? {} : { generationId: this.generationId }),
       ...(this.phase === undefined ? {} : { phase: this.phase }),
-      ...(this.operation === undefined ? {} : { operationId: this.operation.id, reason: this.operation.reason, startedAt: this.operation.startedAt }),
+      ...(this.operation === undefined ? {} : { operationId: this.operation.id, reason: this.operation.reason, resumeIntent: this.operation.resume, startedAt: this.operation.startedAt }),
       ...(this.lastOutcome === undefined ? {} : { lastOutcome: this.lastOutcome }),
     };
   }
