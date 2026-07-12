@@ -2,20 +2,34 @@
 
 Extension-owned coordination for safe Pi context compaction, resume admission, and fresh-session handoff.
 
-This repository is the lifecycle authority for the cross-extension contract tracked by [pi-context-lifecycle#1](https://github.com/yourdigitaltoolbox/pi-context-lifecycle/issues/1) and [ydtb-control-plane#66](https://github.com/yourdigitaltoolbox/ydtb-control-plane/issues/66). It targets Node 22.19.0 or newer and unmodified `@earendil-works/pi-coding-agent` 0.80.6 using documented extension and public SDK APIs only.
+This repository is the lifecycle authority for [pi-context-lifecycle#1](https://github.com/yourdigitaltoolbox/pi-context-lifecycle/issues/1) and [ydtb-control-plane#66](https://github.com/yourdigitaltoolbox/ydtb-control-plane/issues/66). It targets Node 22.19.0 or newer and unmodified `@earendil-works/pi-coding-agent` 0.80.6 through documented extension and public SDK APIs only.
 
-## Slice 1 surface
+The current `feat/context-lifecycle-v1` branch and draft PR are Build candidates, not a published or globally installed release.
 
-The current review branch contains the first managed tracer:
+## Supported boundary
 
-1. `self_compact` returns a normal tool result and records a request.
-2. The process-global lifecycle authority closes managed wake admission.
-3. The coordinator calls `ctx.compact()` exactly once, and only from `agent_settled`.
-4. The managed call succeeds only when exactly one `reason: "manual"` durable `session_compact` event is observed before that coordinator-owned call invokes `onComplete`; zero, multiple, or automatic events fail closed.
-5. The resume includes its operation/generation marker. Only an exact matching resumed user `message_start` establishes admission; handled, transformed, assistant, or unrelated messages/runs do not.
-6. The matched resume run must reach `agent_settled` before an empty finite release cut completes and the authority returns to `idle`.
+The managed profile supports:
 
-Failure recovery, automatic/native compaction adoption, aliases, repair commands, handoff, deadlines, and full consumer lanes are deliberately Slice 2 or later. Native manual `/compact` is not a managed entry point.
+- the `self_compact` tool;
+- `/self_compact` and `/self-compact` command aliases;
+- requests joined through the public lifecycle registry, including future Remote Pi callers;
+- Pi's native automatic threshold and overflow compaction;
+- command-context `/handoff-new-session`.
+
+Native manual `/compact` is an unmanaged escape hatch. The coordinator adopts it best-effort only after Pi emits `session_before_compact`; it cannot protect the earlier extension-invisible TUI interval and does not present that path as a safety guarantee.
+
+## Lifecycle behavior
+
+1. A tool request appends a bounded metadata-only claim and returns a normal tool result.
+2. The coordinator closes managed wake admission and waits for the requesting agent run to settle.
+3. It invokes `ctx.compact()` once. Successful managed completion requires exactly one matching durable manual `session_compact` event plus the operation-owned `onComplete` callback.
+4. A successful self operation persists `resume-pending` and `resume-admitting`, sends one operation/generation-marked resume, and waits for the exact user `message_start` plus its `agent_settled` barrier.
+5. Release captures one finite per-consumer watermark/count cut. Drainers run sequentially by priority under opaque, generation-bound permits and must acknowledge the exact handled watermark/count within five seconds.
+6. The operation returns to idle only after every captured lane is empty, submitted/durably represented, or an explicit block is recorded.
+
+Managed `onError` releases the unchanged session without a resume. Automatic threshold/overflow success is authoritative only from `session_compact`; same-generation `agent_settled` after an observed automatic preflight and no success event proves the enclosing attempt stopped without success. Public-SDK tests cover automatic threshold success and managed provider-failure ordering.
+
+Observation deadlines warn after two minutes and block after ten minutes for compaction, warn after 30 seconds and block after 60 seconds for resume admission, and block one drainer after five seconds. Deadlines never unlock, resend, or fabricate success. Late current-operation terminal evidence can still resolve a compaction block.
 
 ## Consumer API
 
@@ -24,13 +38,59 @@ import {
   admitWake,
   getContextLifecycleSnapshotV1,
   observeContextLifecycleV1,
+  registerContextLifecycleDrainerV1,
+  repairContextLifecycleV1,
   requestCompaction,
 } from "@yourdigitaltoolbox/pi-context-lifecycle";
 ```
 
-Helpers share one structural registry at `Symbol.for("yourdigitaltoolbox.pi-context-lifecycle.v1")`, even when independently resolved package copies are loaded. Observation atomically subscribes and returns the current sequenced snapshot. Every compaction request and wake admission must carry the current `generationId`; omission or mismatch is rejected before delegation. Both APIs return synchronous structured dispositions. Held payloads never enter the coordinator.
+Helpers share one structural registry at `Symbol.for("yourdigitaltoolbox.pi-context-lifecycle.v1")`, even when independently resolved package copies are loaded. Publication uses compare-and-swap ownership; observation atomically subscribes and returns the current sequenced snapshot; compaction and wake admission require the current session generation.
 
-Managed profiles treat `unavailable` and `incompatible` admission as fail-closed configuration errors. A release permit is authorized by short-lived object identity; copying its diagnostic fields does not copy authority.
+Held bodies never enter the coordinator. A drainer captures only `{ watermark, heldCount }`; its permit carries that frozen cut, and its acknowledgement must prove `handledThrough` and `handledCount`. Copying permit fields does not copy its object-identity authority.
+
+Managed profiles treat unavailable or incompatible authority as a visible fail-closed configuration error.
+
+## Durable recovery and repair
+
+The extension appends metadata-only custom entries for:
+
+```text
+requested → compacting → compacted → resume-pending → resume-admitting
+→ resume-admitted → resume-settled → released
+```
+
+Terminal alternatives include `failed`, `cancelled`, and `blocked-unknown`. Entries contain owner, session, generation, operation, reason, state, and timestamp only—never prompts, focus text, summaries, tool output, credentials, or mesh bodies.
+
+A replacement owner restores every nonterminal old-owner claim as blocked under a fresh generation. `/context-lifecycle status` exposes the redacted snapshot and bounded diagnostics. `/context-lifecycle repair <exact-json-request>` applies only an exact operation/session/generation/phase/snapshot-sequence compare-and-swap and supports:
+
+- recognizing verified persisted resume admission/run evidence;
+- retrying a restored `resume-pending` claim before any admission attempt;
+- abandoning a restored ambiguous `resume-admitting` claim without resend after owner replacement;
+- retrying the existing idempotent blocked drainer cut with a fresh opaque permit;
+- abandoning a restored never-started operation after branch-validated owner replacement.
+
+Caller assertion alone does not establish current-process quiescence. Persisted resume recognition additionally passes through the extension's session-entry verifier. Ambiguous current-owner admission never automatically resends.
+
+## Fresh-session handoff
+
+The `handoff_new_session` tool does **not** inject slash-command text. Pi 0.80.6 exposes replacement only in command context, so the tool returns the exact `/handoff-new-session` command for the operator to invoke after the current turn settles.
+
+The command calls `newSession({ parentSession, withSession })` once and uses only the replacement context to send one kickoff naming the durable handoff and next step. Session shutdown/reload/replacement disposes the old registry owner; a later `session_start` publishes a fresh owner/generation, and old contexts, callbacks, timers, and permits remain inert.
+
+## Candidate harness
+
+`@yourdigitaltoolbox/pi-context-lifecycle/testing` exports:
+
+- disposable HOME/Pi/cwd/session/cache/socket/artifact roots;
+- a deterministic deferred fake provider, including provider failure;
+- an immutable candidate-manifest validator;
+- bounded redacted structured timelines;
+- deterministic scenario and bounded soak drivers;
+- a packaged-archive install/import smoke driver.
+
+The manifest validator requires full commit/tree identities, SHA-256 archive/lock digests, exact Pi version/integrity, a deterministic scenario seed, relative archive paths, and a complete unique package order. Candidate-specific values and outputs remain outside lifecycle source so they cannot create a self-referential commit identity.
+
+The real-session suite uses public Pi SDK/session APIs and disposable roots. It currently proves the managed success path, provider failure, automatic threshold compaction, successful-response overflow compaction, exact resume admission, rejected handled/transformed/unrelated resume paths, and command-context handoff routing. Final four-package consumer races and the 100-cycle exact-candidate soak are completed after consumer adapters are pinned in later Build slices.
 
 ## Development
 
@@ -39,9 +99,11 @@ npm ci
 npm run test:unit
 npm run test:integration
 npm run test:real-session
+npm run test:packaged-smoke
+npm run test:candidate
 npm run check
 npm run ci
 npm pack --dry-run
 ```
 
-The Slice 1 public-SDK harness uses a deterministic deferred fake provider and creates HOME, Pi agent, cwd, session, cache, socket, and artifact roots under the OS temporary directory. It never discovers or mutates the operator's live `~/.pi` profile. This source-level tracer test and `npm pack --dry-run` are chassis/package-shape evidence, not packaged-candidate proof; immutable archive installation and candidate manifests belong to later approved slices. Lifecycle diagnostics contain bounded identity/state metadata only—never prompts, summaries, tool output, credentials, or mesh bodies.
+`npm run test:packaged-smoke` builds and packs the candidate, installs the tarball under disposable roots, and imports its public main and extension exports. No test discovers or mutates the operator's live `~/.pi` profile, uses private Pi imports, monkey-patches core, publishes packages, or performs deployment work.

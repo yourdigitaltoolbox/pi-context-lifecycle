@@ -371,6 +371,97 @@ describe("public SDK managed tracer", () => {
     }
   });
 
+  it("adopts successful-response overflow compaction without fabricating a retry", async () => {
+    const roots = await createDisposableHarnessRoots();
+    try {
+      await withDisposableHarnessEnvironment(roots, async () => {
+        const provider = createDeferredFakeProvider({ models: [{ id: "overflow-model", contextWindow: 15_000, maxTokens: 8_000 }] });
+        const overflow = provider.enqueue(fauxAssistantMessage("Completed response whose measured input exceeded the configured context window."));
+        const historySummary = provider.enqueue(fauxAssistantMessage("Overflow history summary."));
+        const turnSummary = provider.enqueue(fauxAssistantMessage("Overflow turn summary."));
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 2_000 } });
+        const reasons: string[] = [];
+        const observerExtension = (pi: ExtensionAPI) => {
+          pi.on("session_before_compact", (event) => { reasons.push(`before:${event.reason}:retry=${String(event.willRetry)}`); });
+          pi.on("session_compact", (event) => { reasons.push(`after:${event.reason}:retry=${String(event.willRetry)}`); });
+          pi.registerProvider(provider.provider, {
+            api: provider.api,
+            apiKey: "disposable-test-key",
+            baseUrl: "http://localhost.invalid",
+            models: provider.models.map((model) => ({
+              id: model.id,
+              name: model.name,
+              api: model.api,
+              reasoning: model.reasoning,
+              input: model.input,
+              cost: model.cost,
+              contextWindow: model.contextWindow,
+              maxTokens: model.maxTokens,
+            })),
+            streamSimple: (model, context, options) => provider.streamSimple(model, context, options),
+          });
+        };
+        const loader = new DefaultResourceLoader({ cwd: roots.cwd, agentDir: roots.agentDir, settingsManager, extensionFactories: [observerExtension, contextLifecycleExtension] });
+        await loader.reload();
+        const sessionManager = SessionManager.create(roots.cwd, roots.sessions);
+        for (let index = 0; index < 10; index += 1) {
+          sessionManager.appendMessage({ role: "user", content: `overflow-history-${index} ${"u".repeat(4_000)}`, timestamp: Date.now() });
+          sessionManager.appendMessage(fauxAssistantMessage(`overflow-response-${index} ${"a".repeat(4_000)}`));
+        }
+        const { session } = await createAgentSession({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          sessionManager,
+          model: provider.getModel(),
+          tools: [],
+        });
+        await session.bindExtensions({ mode: "print" });
+        let maximumActiveRuns = 0;
+        let activeRuns = 0;
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "agent_start") { activeRuns += 1; maximumActiveRuns = Math.max(maximumActiveRuns, activeRuns); }
+          if (event.type === "agent_settled") activeRuns -= 1;
+        });
+        const wait = async (promise: Promise<unknown>, label: string): Promise<void> => {
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            await Promise.race([promise, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}; calls=${provider.callCount}; reasons=${JSON.stringify(reasons)}`)), 5_000); })]);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+        };
+        try {
+          const prompt = session.prompt("Trigger deterministic context overflow recovery.");
+          await wait(overflow.call, "overflow response");
+          overflow.release();
+          await wait(historySummary.call, "overflow history summary");
+          historySummary.release();
+          await wait(turnSummary.call, "overflow turn summary");
+          turnSummary.release();
+          await wait(prompt, "overflow recovery prompt");
+          await vi.waitFor(() => expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" }), { timeout: 5_000 });
+
+          expect(reasons).toEqual(["before:overflow:retry=false", "after:overflow:retry=false"]);
+          expect(provider.callCount).toBe(3);
+          expect(maximumActiveRuns).toBe(1);
+          expect(activeRuns).toBe(0);
+          expect(sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+        } finally {
+          unsubscribe();
+          session.dispose();
+        }
+      });
+    } finally {
+      await roots.cleanup();
+    }
+  });
+
   it("routes fresh handoff through public command context exactly once without a provider turn", async () => {
     const roots = await createDisposableHarnessRoots();
     try {
