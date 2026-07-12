@@ -32,6 +32,7 @@ export interface ManagedCompactionAdapter {
   compact(options: { customInstructions: string; onComplete(): void; onError(error: Error): void }): void;
   sendResume(message: string): void;
   appendLifecycleEntry?(claim: LifecycleClaim): void;
+  verifyRepairEvidence?(request: RepairRequest): boolean;
 }
 
 interface ActiveOperation {
@@ -431,7 +432,8 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (request.action === "recognize-resume-admitted") {
       const restorableResume = this.blockedReason === "restored-resume-admitting" || this.blockedReason === "restored-resume-admitted";
       const evidenceMatches = request.evidenceClass === "persisted-resume-message" || request.evidenceClass === "persisted-resume-run-settled";
-      if (!oldOwnerCannotExecute || !restorableResume || !evidenceMatches || !this.operation.resume || this.lastOutcome !== "completed") return reject("repair-not-applicable");
+      const evidenceVerified = request.evidenceEntryId !== undefined && this.adapter?.verifyRepairEvidence?.(request) === true;
+      if (!oldOwnerCannotExecute || !restorableResume || !evidenceMatches || !evidenceVerified || !this.operation.resume || this.lastOutcome !== "completed") return reject("repair-not-applicable");
       this.record("repair-applied", {
         action: request.action,
         evidenceClass: request.evidenceClass,

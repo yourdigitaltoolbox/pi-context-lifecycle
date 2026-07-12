@@ -144,6 +144,7 @@ export interface RepairRequest {
   actor: RepairActor;
   channel: RepairChannel;
   consumerId?: string;
+  evidenceEntryId?: string;
 }
 
 export type RepairDisposition =

@@ -541,9 +541,10 @@ describe("managed lifecycle coordinator", () => {
     const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
     const sendResume = vi.fn<ManagedCompactionAdapter["sendResume"]>();
     const claims: string[] = [];
+    const verifyRepairEvidence = vi.fn(() => true);
     const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
     coordinator.attachPublication(publication);
-    const generationId = coordinator.bindSession("session", { compact, sendResume, appendLifecycleEntry: (claim) => claims.push(claim.state) });
+    const generationId = coordinator.bindSession("session", { compact, sendResume, appendLifecycleEntry: (claim) => claims.push(claim.state), verifyRepairEvidence });
     coordinator.restoreClaims([{
       schemaVersion: 1,
       ownerInstanceId: "old-owner",
@@ -565,6 +566,7 @@ describe("managed lifecycle coordinator", () => {
       expectedPhase: "blocked-unknown",
       expectedSequence: blocked.sequence,
       evidenceClass: "persisted-resume-run-settled",
+      evidenceEntryId: "persisted-resume-entry",
       actor: "operator",
       channel: "command",
     })).toMatchObject({ disposition: "applied", action: "recognize-resume-admitted" });
@@ -572,6 +574,7 @@ describe("managed lifecycle coordinator", () => {
 
     expect(registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
     expect(sendResume).not.toHaveBeenCalled();
+    expect(verifyRepairEvidence).toHaveBeenCalledTimes(1);
     expect(claims).toEqual(["resume-admitted", "resume-settled", "released"]);
   });
 

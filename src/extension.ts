@@ -67,6 +67,31 @@ function lifecycleClaims(ctx: ExtensionContext): LifecycleClaim[] {
   return claims;
 }
 
+function messageText(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const text: string[] = [];
+  for (const block of content as unknown[]) {
+    if (typeof block !== "object" || block === null) return undefined;
+    const candidate = block as Record<string, unknown>;
+    if (candidate.type !== "text" || typeof candidate.text !== "string") return undefined;
+    text.push(candidate.text);
+  }
+  return text.join("");
+}
+
+function verifyPersistedResumeEvidence(ctx: ExtensionContext, request: RepairRequest): boolean {
+  if (request.evidenceEntryId === undefined || (request.evidenceClass !== "persisted-resume-message" && request.evidenceClass !== "persisted-resume-run-settled")) return false;
+  const entries = ctx.sessionManager.getEntries();
+  const index = entries.findIndex((entry) => entry.id === request.evidenceEntryId);
+  const entry = entries[index];
+  if (entry?.type !== "message" || entry.message.role !== "user") return false;
+  const text = messageText(entry.message.content);
+  if (text === undefined || !text.includes(`pi-context-lifecycle:v1 resume operationId=${request.operationId} `)) return false;
+  if (request.evidenceClass === "persisted-resume-message") return true;
+  return entries.slice(index + 1).some((candidate) => candidate.type === "message" && candidate.message.role === "assistant");
+}
+
 const REPAIR_ACTIONS = new Set<RepairAction>(["recognize-resume-admitted", "retry-resume-pending", "abandon-ambiguous-resume", "retry-blocked-drainer", "abandon-interrupted-operation"]);
 const REPAIR_EVIDENCE_CLASSES = new Set<RepairEvidenceClass>(["persisted-resume-message", "persisted-resume-run-settled", "no-admission-attempt", "current-process-quiescent", "owner-process-replaced", "idempotent-drainer-state", "branch-validated-owner-replaced"]);
 
@@ -82,7 +107,8 @@ function parseRepairRequest(value: string): RepairRequest | undefined {
       || typeof request.sessionId !== "string" || request.sessionId.length === 0
       || typeof request.generationId !== "string" || request.generationId.length === 0
       || typeof request.expectedSequence !== "number" || !Number.isSafeInteger(request.expectedSequence) || request.expectedSequence < 0
-      || (request.consumerId !== undefined && (typeof request.consumerId !== "string" || request.consumerId.length === 0))) return undefined;
+      || (request.consumerId !== undefined && (typeof request.consumerId !== "string" || request.consumerId.length === 0))
+      || (request.evidenceEntryId !== undefined && (typeof request.evidenceEntryId !== "string" || request.evidenceEntryId.length === 0))) return undefined;
     return request as unknown as RepairRequest;
   } catch {
     return undefined;
@@ -135,6 +161,9 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
       },
       appendLifecycleEntry(claim) {
         pi.appendEntry("pi-context-lifecycle", claim);
+      },
+      verifyRepairEvidence(request) {
+        return verifyPersistedResumeEvidence(binding.context, request);
       },
     };
     binding.generationId = next.bindSession(binding.sessionId, adapter);
