@@ -107,8 +107,20 @@ export interface DrainerRegistration {
   drain(permit: ReleasePermit): Promise<DrainAck> | DrainAck;
 }
 
-export type RepairAction = "abandon-ambiguous-resume";
-export type RepairEvidenceClass = "current-process-quiescent" | "owner-process-replaced";
+export type RepairAction =
+  | "recognize-resume-admitted"
+  | "retry-resume-pending"
+  | "abandon-ambiguous-resume"
+  | "retry-blocked-drainer"
+  | "abandon-interrupted-operation";
+export type RepairEvidenceClass =
+  | "persisted-resume-message"
+  | "persisted-resume-run-settled"
+  | "no-admission-attempt"
+  | "current-process-quiescent"
+  | "owner-process-replaced"
+  | "idempotent-drainer-state"
+  | "branch-validated-owner-replaced";
 export type RepairActor = "operator";
 export type RepairChannel = "command" | "remote";
 
@@ -122,6 +134,7 @@ export interface RepairRequest {
   evidenceClass: RepairEvidenceClass;
   actor: RepairActor;
   channel: RepairChannel;
+  consumerId?: string;
 }
 
 export type RepairDisposition =

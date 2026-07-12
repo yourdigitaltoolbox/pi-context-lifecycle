@@ -249,6 +249,50 @@ describe("managed lifecycle coordinator", () => {
     }
   });
 
+  it("retries only the blocked drainer in the existing cut with a fresh permit", async () => {
+    const test = setup();
+    const permits: ReleasePermit[] = [];
+    let attempts = 0;
+    test.coordinator.registerDrainer({
+      consumerId: "consumer",
+      priority: 1,
+      generationId: test.generationId,
+      drain(permit) {
+        permits.push(permit);
+        attempts += 1;
+        return {
+          releaseId: permit.releaseId,
+          consumerId: permit.consumerId,
+          disposition: attempts === 1 ? "blocked" : "empty",
+          submittedCount: 0,
+        };
+      },
+    });
+    test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+    test.coordinator.onAgentSettled(test.generationId);
+    completeManagedCompaction(test);
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("blocked-unknown"));
+    const blocked = test.registry.snapshot();
+
+    expect(test.registry.repair({
+      action: "retry-blocked-drainer",
+      operationId: blocked.operationId ?? "missing",
+      sessionId: "session",
+      generationId: test.generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "idempotent-drainer-state",
+      actor: "operator",
+      channel: "command",
+      consumerId: "consumer",
+    })).toMatchObject({ disposition: "applied", action: "retry-blocked-drainer" });
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
+
+    expect(attempts).toBe(2);
+    expect(permits[1]).not.toBe(permits[0]);
+    expect(permits[1]?.releaseId).not.toBe(permits[0]?.releaseId);
+  });
+
   it("authorizes release by opaque permit identity, not copied fields", async () => {
     const test = setup();
     let permit!: ReleasePermit;
@@ -399,6 +443,138 @@ describe("managed lifecycle coordinator", () => {
       priorPhase: "blocked-unknown",
       newPhase: "releasing",
     }));
+  });
+
+  it("recognizes a persisted settled resume run and releases without another admission", async () => {
+    const registry = registryForHost({});
+    const coordinator = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
+    const sendResume = vi.fn<ManagedCompactionAdapter["sendResume"]>();
+    const claims: string[] = [];
+    const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
+    coordinator.attachPublication(publication);
+    const generationId = coordinator.bindSession("session", { compact, sendResume, appendLifecycleEntry: (claim) => claims.push(claim.state) });
+    coordinator.restoreClaims([{
+      schemaVersion: 1,
+      ownerInstanceId: "old-owner",
+      originOwnerInstanceId: "old-owner",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId: "old-generation",
+      state: "resume-admitting",
+      reason: "self",
+      timestamp: 1,
+    }]);
+    const blocked = registry.snapshot();
+
+    expect(registry.repair({
+      action: "recognize-resume-admitted",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "persisted-resume-run-settled",
+      actor: "operator",
+      channel: "command",
+    })).toMatchObject({ disposition: "applied", action: "recognize-resume-admitted" });
+    await Promise.resolve();
+
+    expect(registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
+    expect(sendResume).not.toHaveBeenCalled();
+    expect(claims).toEqual(["resume-admitted", "resume-settled", "released"]);
+  });
+
+  it("retries a restored resume-pending claim exactly once before any admission attempt", () => {
+    const registry = registryForHost({});
+    const coordinator = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
+    const sendResume = vi.fn<ManagedCompactionAdapter["sendResume"]>();
+    const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
+    coordinator.attachPublication(publication);
+    const generationId = coordinator.bindSession("session", { compact, sendResume });
+    coordinator.restoreClaims([{
+      schemaVersion: 1,
+      ownerInstanceId: "old-owner",
+      originOwnerInstanceId: "old-owner",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId: "old-generation",
+      state: "resume-pending",
+      reason: "self",
+      timestamp: 1,
+    }]);
+    const blocked = registry.snapshot();
+
+    expect(registry.repair({
+      action: "retry-resume-pending",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "no-admission-attempt",
+      actor: "operator",
+      channel: "command",
+    })).toMatchObject({ disposition: "applied", action: "retry-resume-pending" });
+
+    expect(registry.snapshot().phase).toBe("resuming");
+    expect(sendResume).toHaveBeenCalledTimes(1);
+    expect(sendResume.mock.calls[0]?.[0]).toContain("old-operation");
+    expect(sendResume.mock.calls[0]?.[0]).toContain(generationId);
+    expect(registry.repair({
+      action: "retry-resume-pending",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "no-admission-attempt",
+      actor: "operator",
+      channel: "command",
+    })).toMatchObject({ disposition: "rejected" });
+    expect(sendResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("abandons a restored never-started operation after branch-validated owner replacement", async () => {
+    const registry = registryForHost({});
+    const coordinator = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
+    const sendResume = vi.fn<ManagedCompactionAdapter["sendResume"]>();
+    const claims: string[] = [];
+    const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
+    coordinator.attachPublication(publication);
+    const generationId = coordinator.bindSession("session", { compact, sendResume, appendLifecycleEntry: (claim) => claims.push(claim.state) });
+    coordinator.restoreClaims([{
+      schemaVersion: 1,
+      ownerInstanceId: "old-owner",
+      originOwnerInstanceId: "old-owner",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId: "old-generation",
+      state: "requested",
+      reason: "self",
+      timestamp: 1,
+    }]);
+    const blocked = registry.snapshot();
+
+    expect(registry.repair({
+      action: "abandon-interrupted-operation",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId,
+      expectedPhase: "blocked-unknown",
+      expectedSequence: blocked.sequence,
+      evidenceClass: "branch-validated-owner-replaced",
+      actor: "operator",
+      channel: "command",
+    })).toMatchObject({ disposition: "applied", action: "abandon-interrupted-operation" });
+    await Promise.resolve();
+
+    expect(registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "cancelled" });
+    expect(compact).not.toHaveBeenCalled();
+    expect(sendResume).not.toHaveBeenCalled();
+    expect(claims).toEqual(["cancelled", "released"]);
   });
 
   it("keeps a disposed generation inert when an old drainer deadline or ack arrives", async () => {

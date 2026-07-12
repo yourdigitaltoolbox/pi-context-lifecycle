@@ -102,6 +102,9 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private readonly records: DiagnosticRecord[] = [];
   private readonly drainers = new Map<string, RegisteredDrainer>();
   private readonly activePermits = new Set<ReleasePermit>();
+  private releaseCut: RegisteredDrainer[] | undefined;
+  private releaseIndex = 0;
+  private blockedDrainerConsumerId: string | undefined;
   private compactionWarningTimer: ReturnType<typeof setTimeout> | undefined;
   private compactionBlockTimer: ReturnType<typeof setTimeout> | undefined;
   private resumeWarningTimer: ReturnType<typeof setTimeout> | undefined;
@@ -140,7 +143,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       startedAt: latest.timestamp,
       resume: latest.state.startsWith("resume-") || latest.reason === "self",
       customInstructions: "",
-      resumeMessage: "",
+      resumeMessage: markedResumeMessage(DEFAULT_RESUME_MESSAGE, latest.operationId, this.generationId),
       compactStarted: latest.state !== "requested",
       matchingManagedSuccessEvents: 0,
       managedCompleteObserved: latest.state !== "requested" && latest.state !== "compacting",
@@ -402,11 +405,95 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (request.generationId !== this.generationId) return reject("generation-mismatch");
     if (request.operationId !== this.operation.id) return reject("operation-mismatch");
     if (request.expectedPhase !== this.phase) return reject("phase-mismatch");
-    const oldOwnerCannotExecute = this.operation.originOwnerInstanceId !== this.ownerInstanceId
-      && this.blockedReason === "restored-resume-admitting"
-      && request.evidenceClass === "owner-process-replaced";
-    if (!oldOwnerCannotExecute || !this.operation.resume || this.operation.resumeMessageMatched || this.lastOutcome !== "completed") return reject("repair-not-applicable");
-
+    const oldOwnerCannotExecute = this.operation.originOwnerInstanceId !== this.ownerInstanceId;
+    if (request.action === "recognize-resume-admitted") {
+      const restorableResume = this.blockedReason === "restored-resume-admitting" || this.blockedReason === "restored-resume-admitted";
+      const evidenceMatches = request.evidenceClass === "persisted-resume-message" || request.evidenceClass === "persisted-resume-run-settled";
+      if (!oldOwnerCannotExecute || !restorableResume || !evidenceMatches || !this.operation.resume || this.lastOutcome !== "completed") return reject("repair-not-applicable");
+      this.record("repair-applied", {
+        action: request.action,
+        evidenceClass: request.evidenceClass,
+        actor: request.actor,
+        channel: request.channel,
+        priorPhase: "blocked-unknown",
+        newPhase: request.evidenceClass === "persisted-resume-run-settled" ? "releasing" : "resuming",
+      });
+      if (this.blockedReason === "restored-resume-admitting" && !this.persistClaim("resume-admitted")) {
+        this.block("claim-persist-failed", false);
+        return reject("claim-persist-failed");
+      }
+      this.operation.resumeMessageMatched = true;
+      if (request.evidenceClass === "persisted-resume-message") {
+        this.blockedReason = undefined;
+        this.phase = "resuming";
+        this.transition("persisted-resume-admission-recognized");
+      } else {
+        if (!this.persistClaim("resume-settled")) {
+          this.block("claim-persist-failed", false);
+          return reject("claim-persist-failed");
+        }
+        this.operation.resume = false;
+        void this.release(true);
+      }
+      return { disposition: "applied", action: request.action, operationId: request.operationId, generationId: this.generationId };
+    }
+    if (request.action === "retry-resume-pending") {
+      if (!oldOwnerCannotExecute || this.blockedReason !== "restored-resume-pending" || request.evidenceClass !== "no-admission-attempt" || !this.operation.resume || this.lastOutcome !== "completed") return reject("repair-not-applicable");
+      this.record("repair-applied", {
+        action: request.action,
+        evidenceClass: request.evidenceClass,
+        actor: request.actor,
+        channel: request.channel,
+        priorPhase: "blocked-unknown",
+        newPhase: "resuming",
+      });
+      this.blockedReason = undefined;
+      this.phase = "resuming";
+      if (!this.persistClaim("resume-admitting")) {
+        this.block("claim-persist-failed", false);
+        return reject("claim-persist-failed");
+      }
+      this.transition("resume-pending-retried");
+      this.scheduleResumeDeadlines(this.operation.id);
+      this.adapter?.sendResume(this.operation.resumeMessage);
+      return { disposition: "applied", action: request.action, operationId: request.operationId, generationId: this.generationId };
+    }
+    if (request.action === "abandon-ambiguous-resume") {
+      if (!oldOwnerCannotExecute || this.blockedReason !== "restored-resume-admitting" || request.evidenceClass !== "owner-process-replaced" || !this.operation.resume || this.operation.resumeMessageMatched || this.lastOutcome !== "completed") return reject("repair-not-applicable");
+      this.record("repair-applied", {
+        action: request.action,
+        evidenceClass: request.evidenceClass,
+        actor: request.actor,
+        channel: request.channel,
+        priorPhase: "blocked-unknown",
+        newPhase: "releasing",
+      });
+      this.operation.resume = false;
+      void this.release(true);
+      return { disposition: "applied", action: request.action, operationId: request.operationId, generationId: this.generationId };
+    }
+    if (request.action === "retry-blocked-drainer") {
+      const drainer = this.releaseCut?.[this.releaseIndex];
+      const retryableBlock = this.blockedReason === "drainer-deadline" || this.blockedReason === "drainer-threw" || this.blockedReason === "drainer-blocked";
+      if (!retryableBlock || request.evidenceClass !== "idempotent-drainer-state" || request.consumerId === undefined || request.consumerId !== this.blockedDrainerConsumerId || drainer?.consumerId !== request.consumerId) return reject("repair-not-applicable");
+      this.record("repair-applied", {
+        action: request.action,
+        evidenceClass: request.evidenceClass,
+        actor: request.actor,
+        channel: request.channel,
+        priorPhase: "blocked-unknown",
+        newPhase: "releasing",
+      });
+      void this.release(true, true);
+      return { disposition: "applied", action: request.action, operationId: request.operationId, generationId: this.generationId };
+    }
+    if (!oldOwnerCannotExecute || request.evidenceClass !== "branch-validated-owner-replaced") return reject("repair-not-applicable");
+    if (this.blockedReason !== "restored-requested") return reject("fresh-session-required");
+    this.lastOutcome = "cancelled";
+    if (!this.persistClaim("cancelled")) {
+      this.block("claim-persist-failed", false);
+      return reject("claim-persist-failed");
+    }
     this.record("repair-applied", {
       action: request.action,
       evidenceClass: request.evidenceClass,
@@ -430,6 +517,9 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.clearAllDeadlines();
     this.activePermits.clear();
     this.drainers.clear();
+    this.releaseCut = undefined;
+    this.releaseIndex = 0;
+    this.blockedDrainerConsumerId = undefined;
     this.phase = undefined;
     this.adapter = undefined;
     const result = this.publication?.dispose() ?? false;
@@ -460,16 +550,25 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     });
   }
 
-  private async release(fromBlockedRepair = false): Promise<void> {
+  private async release(fromBlockedRepair = false, retryBlockedDrainer = false): Promise<void> {
     if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting" && this.phase !== "observed-preflight" && !(fromBlockedRepair && this.phase === "blocked-unknown"))) return;
     this.clearAllDeadlines();
     this.blockedReason = undefined;
+    this.blockedDrainerConsumerId = undefined;
     this.phase = "releasing";
-    this.transition("release-started");
+    if (!retryBlockedDrainer) {
+      this.releaseCut = [...this.drainers.values()].sort((left, right) => left.priority - right.priority || left.consumerId.localeCompare(right.consumerId));
+      this.releaseIndex = 0;
+    }
+    if (this.releaseCut === undefined) {
+      this.block("release-cut-unavailable");
+      return;
+    }
+    this.transition(retryBlockedDrainer ? "blocked-drainer-retry-started" : "release-started");
     const operation = this.operation;
-    const drainers = [...this.drainers.values()].sort((left, right) => left.priority - right.priority || left.consumerId.localeCompare(right.consumerId));
-    for (const drainer of drainers) {
-      if (!this.isCurrentGeneration(drainer.generationId) || this.operation !== operation) return;
+    while (this.releaseIndex < this.releaseCut.length) {
+      const drainer = this.releaseCut[this.releaseIndex];
+      if (drainer === undefined || !this.isCurrentGeneration(drainer.generationId) || this.operation !== operation) return;
       const permit: ReleasePermit = Object.freeze({
         protocolVersion: 1,
         sessionId: this.sessionId,
@@ -484,6 +583,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         pendingAck = drainer.drain(permit);
       } catch {
         this.activePermits.delete(permit);
+        this.blockedDrainerConsumerId = drainer.consumerId;
         this.block("drainer-threw");
         return;
       }
@@ -491,18 +591,22 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       if (this.disposed || this.operation !== operation || drainer.generationId !== this.generationId) return;
       this.activePermits.delete(permit);
       if (outcome.kind === "timeout") {
+        this.blockedDrainerConsumerId = drainer.consumerId;
         this.block("drainer-deadline");
         return;
       }
       if (outcome.kind === "threw") {
+        this.blockedDrainerConsumerId = drainer.consumerId;
         this.block("drainer-threw");
         return;
       }
       const ack = outcome.ack;
       if (ack.releaseId !== permit.releaseId || ack.consumerId !== permit.consumerId || ack.submittedCount < 0 || ack.disposition === "blocked") {
+        this.blockedDrainerConsumerId = drainer.consumerId;
         this.block("drainer-blocked");
         return;
       }
+      this.releaseIndex += 1;
     }
     if (this.operation !== operation || this.disposed) return;
     if (!this.persistClaim("released")) {
@@ -510,6 +614,8 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       return;
     }
     this.operation = undefined;
+    this.releaseCut = undefined;
+    this.releaseIndex = 0;
     this.phase = "idle";
     this.transition("release-completed");
   }

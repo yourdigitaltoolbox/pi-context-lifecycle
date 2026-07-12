@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "./coordinator.js";
 import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, publishContextLifecycleV1, repairContextLifecycleV1 } from "./registry.js";
-import type { CompactionReason, LifecycleClaim, LifecycleClaimState, RepairRequest } from "./types.js";
+import type { CompactionReason, LifecycleClaim, LifecycleClaimState, RepairAction, RepairEvidenceClass, RepairRequest } from "./types.js";
 
 const DEFAULT_HANDOFF_THRESHOLD = 0.94;
 const DEFAULT_HANDOFF_REARM_THRESHOLD = 0.65;
@@ -67,18 +67,22 @@ function lifecycleClaims(ctx: ExtensionContext): LifecycleClaim[] {
   return claims;
 }
 
+const REPAIR_ACTIONS = new Set<RepairAction>(["recognize-resume-admitted", "retry-resume-pending", "abandon-ambiguous-resume", "retry-blocked-drainer", "abandon-interrupted-operation"]);
+const REPAIR_EVIDENCE_CLASSES = new Set<RepairEvidenceClass>(["persisted-resume-message", "persisted-resume-run-settled", "no-admission-attempt", "current-process-quiescent", "owner-process-replaced", "idempotent-drainer-state", "branch-validated-owner-replaced"]);
+
 function parseRepairRequest(value: string): RepairRequest | undefined {
   try {
     const request = JSON.parse(value) as Record<string, unknown>;
-    if (request.action !== "abandon-ambiguous-resume"
+    if (typeof request.action !== "string" || !REPAIR_ACTIONS.has(request.action as RepairAction)
       || request.expectedPhase !== "blocked-unknown"
-      || (request.evidenceClass !== "current-process-quiescent" && request.evidenceClass !== "owner-process-replaced")
+      || typeof request.evidenceClass !== "string" || !REPAIR_EVIDENCE_CLASSES.has(request.evidenceClass as RepairEvidenceClass)
       || request.actor !== "operator"
       || (request.channel !== "command" && request.channel !== "remote")
       || typeof request.operationId !== "string" || request.operationId.length === 0
       || typeof request.sessionId !== "string" || request.sessionId.length === 0
       || typeof request.generationId !== "string" || request.generationId.length === 0
-      || typeof request.expectedSequence !== "number" || !Number.isSafeInteger(request.expectedSequence) || request.expectedSequence < 0) return undefined;
+      || typeof request.expectedSequence !== "number" || !Number.isSafeInteger(request.expectedSequence) || request.expectedSequence < 0
+      || (request.consumerId !== undefined && (typeof request.consumerId !== "string" || request.consumerId.length === 0))) return undefined;
     return request as unknown as RepairRequest;
   } catch {
     return undefined;
