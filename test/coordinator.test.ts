@@ -110,7 +110,7 @@ describe("managed lifecycle coordinator", () => {
     }
   });
 
-  it("releases automatic compaction as failed when the same generation settles without success", async () => {
+  it("releases automatic compaction as failed when the enclosing generation settles without success", async () => {
     const test = setup();
     test.coordinator.onSessionBeforeCompact(test.generationId, "overflow");
 
@@ -488,6 +488,50 @@ describe("managed lifecycle coordinator", () => {
 
     expect(test.registry.snapshot()).toMatchObject({ phase: "blocked-unknown", lastOutcome: "completed" });
     expect(test.sendResume).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["requested", "compacting", "compacted", "resume-pending", "resume-admitting", "resume-admitted", "resume-settled", "blocked-unknown"] as const)("restores nonterminal %s from an old owner as blocked in a fresh generation", (state) => {
+    const registry = registryForHost({});
+    const coordinator = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
+    coordinator.attachPublication(publication);
+    const generationId = coordinator.bindSession("session", { compact: vi.fn(), sendResume: vi.fn() });
+    coordinator.restoreClaims([{
+      schemaVersion: 1,
+      ownerInstanceId: "old-owner",
+      originOwnerInstanceId: "old-owner",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId: "old-generation",
+      state,
+      reason: "self",
+      timestamp: 1,
+    }]);
+
+    expect(registry.snapshot()).toMatchObject({ phase: "blocked-unknown", operationId: "old-operation", generationId });
+    expect(generationId).not.toBe("old-generation");
+  });
+
+  it.each(["released", "failed", "cancelled"] as const)("does not restore terminal %s claims", (state) => {
+    const registry = registryForHost({});
+    const coordinator = new ContextLifecycleCoordinatorV1("replacement-owner");
+    const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
+    coordinator.attachPublication(publication);
+    coordinator.bindSession("session", { compact: vi.fn(), sendResume: vi.fn() });
+    coordinator.restoreClaims([{
+      schemaVersion: 1,
+      ownerInstanceId: "old-owner",
+      originOwnerInstanceId: "old-owner",
+      operationId: "old-operation",
+      sessionId: "session",
+      generationId: "old-generation",
+      state,
+      reason: "self",
+      timestamp: 1,
+    }]);
+
+    expect(registry.snapshot()).toMatchObject({ phase: "idle" });
+    expect(registry.snapshot().operationId).toBeUndefined();
   });
 
   it("restores an ambiguous old-owner resume claim and abandons it without resend by exact CAS repair", async () => {

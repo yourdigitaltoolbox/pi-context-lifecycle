@@ -21,6 +21,7 @@ export interface DeferredFakeProvider {
   getModel(): Model<string>;
   streamSimple(model: Model<string>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
   enqueue(response: AssistantMessage): DeferredResponse;
+  enqueueFailure(): DeferredResponse;
 }
 
 export function createDeferredFakeProvider(options: { api?: string; provider?: string; models?: FauxModelDefinition[] } = {}): DeferredFakeProvider {
@@ -42,6 +43,28 @@ export function createDeferredFakeProvider(options: { api?: string; provider?: s
           observe({ context, callCount: state.callCount });
           await gate;
           return response;
+        },
+      ]);
+      let released = false;
+      return {
+        call,
+        release() {
+          if (released) return;
+          released = true;
+          release();
+        },
+      };
+    },
+    enqueueFailure() {
+      let release!: () => void;
+      let observe!: (value: { context: Context; callCount: number }) => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const call = new Promise<{ context: Context; callCount: number }>((resolve) => { observe = resolve; });
+      core.appendResponses([
+        async (context, _streamOptions, state) => {
+          observe({ context, callCount: state.callCount });
+          await gate;
+          throw new Error("deterministic deferred provider failure");
         },
       ]);
       let released = false;

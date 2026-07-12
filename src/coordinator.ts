@@ -156,7 +156,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       managedCompleteObserved: latest.state !== "requested" && latest.state !== "compacting",
       resumeMessageMatched: latest.state === "resume-admitted" || latest.state === "resume-settled",
     };
-    if (latest.state === "compacted" || latest.state.startsWith("resume-") || latest.state === "blocked-unknown") this.lastOutcome = "completed";
+    if (latest.state === "compacted" || latest.state.startsWith("resume-")) this.lastOutcome = "completed";
     this.blockedReason = `restored-${latest.state}`;
     this.phase = "blocked-unknown";
     this.transition("operation-restored-blocked");
@@ -225,7 +225,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     }
     if (this.phase === "observed-preflight" && !this.operation.managed) {
       this.lastOutcome = "failed";
-      this.persistClaim("failed");
+      if (!this.persistClaim("failed")) {
+        this.block("claim-persist-failed", false);
+        return;
+      }
       this.record("automatic-compaction-failed");
       void this.release();
       return;
