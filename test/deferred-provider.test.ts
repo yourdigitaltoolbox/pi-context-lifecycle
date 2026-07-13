@@ -39,6 +39,51 @@ describe("deferred fake provider tracker", () => {
     expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, inFlight: 0, maxInFlight: 1 });
   });
 
+  it("settles a pre-compaction producer response before the self_compact response may enter", async () => {
+    const provider = createDeferredFakeProvider();
+    const producer = provider.enqueue(fauxAssistantMessage("redacted producer completion"), { label: "pre-compaction-producer" });
+    const selfCompact = provider.enqueue(fauxAssistantMessage("self compact"), { label: "agent-initial" });
+
+    const producerStream = provider.streamSimple(provider.getModel(), context);
+    await producer.call;
+    expect(provider.tracker.calls()).toEqual([{ label: "pre-compaction-producer", callCount: 1 }]);
+    producer.release();
+    await Promise.all([producerStream.result(), producer.completed]);
+    expect(provider.tracker).toMatchObject({ entered: 1, completed: 1, inFlight: 0, maxInFlight: 1 });
+    provider.tracker.assertNoOverlap();
+
+    const selfCompactStream = provider.streamSimple(provider.getModel(), context);
+    await selfCompact.call;
+    expect(provider.tracker.calls()).toEqual([
+      { label: "pre-compaction-producer", callCount: 1 },
+      { label: "agent-initial", callCount: 2 },
+    ]);
+    selfCompact.release();
+    await Promise.all([selfCompactStream.result(), selfCompact.completed]);
+    expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, inFlight: 0, maxInFlight: 1 });
+  });
+
+  it("drives each released producer stream to settlement without overlap", async () => {
+    const provider = createDeferredFakeProvider();
+    const drains = provider.enqueueProducerDrain(fauxAssistantMessage("redacted producer batch"));
+
+    const first = await drains.responseAt(0);
+    const firstStream = provider.streamSimple(provider.getModel(), context);
+    await first.call;
+    expect(provider.tracker).toMatchObject({ entered: 1, inFlight: 1, maxInFlight: 1 });
+    first.release();
+    await Promise.all([firstStream.result(), first.completed]);
+
+    const second = await drains.responseAt(1);
+    const secondStream = provider.streamSimple(provider.getModel(), context);
+    await second.call;
+    expect(provider.tracker).toMatchObject({ entered: 2, completed: 1, inFlight: 1, maxInFlight: 1 });
+    second.release();
+    await Promise.all([secondStream.result(), second.completed]);
+    expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, inFlight: 0, maxInFlight: 1 });
+    provider.tracker.assertNoOverlap();
+  });
+
   it("keeps a released response active until its returned stream reaches terminal settlement", async () => {
     const provider = createDeferredFakeProvider({ tokensPerSecond: 100, tokenSize: { min: 1, max: 1 } });
     const first = provider.enqueue(fauxAssistantMessage("x".repeat(80)), { label: "agent-initial" });

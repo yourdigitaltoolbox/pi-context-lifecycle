@@ -14,7 +14,9 @@ export type DeferredProviderLabel =
   | "compaction-history"
   | "compaction-turn"
   | "self-resume"
-  | "producer-drain";
+  | "producer-drain"
+  /** The real pi-subagents pre-compaction completion turn. */
+  | "pre-compaction-producer";
 
 export type DeferredProviderCompletion = "completed" | "failed" | "cancelled";
 

@@ -75,20 +75,51 @@ const ALL_PRODUCER_BATCHES: readonly ExpectedProducerBatch[] = [
   { laneId: "cron-tick", customType: "cron-timer-tick" },
 ];
 
-function assertAllProducerBatches(submissions: readonly Readonly<{ customType: string; sequence: number }>[], context: ExactCandidateScenarioContext): void {
-  if (context.scenarioId !== "all-producers-concurrent") return;
-  for (const [sequence, batch] of ALL_PRODUCER_BATCHES.entries()) {
-    const matching = submissions.filter((submission) => submission.customType === batch.customType);
-    if (matching.length !== 1 || matching[0]?.sequence !== sequence) {
-      throw new Error(`all-producers lane ${batch.laneId} expected exactly one actual ${batch.customType} submission at sequence ${sequence}, got ${matching.length}`);
-    }
-    context.timeline.record({ type: "all-producers-batch-submitted", outcome: batch.laneId, count: 1, sequence });
+function expectedProducerBatches(scenarioId: string): readonly ExpectedProducerBatch[] | undefined {
+  switch (scenarioId) {
+    case "all-producers-concurrent": return ALL_PRODUCER_BATCHES;
+    // MeshSpool releases reply before unsolicited traffic, each through its
+    // production follow-up submission boundary.
+    case "mesh-during-compaction": return [
+      { laneId: "mesh-reply", customType: "remote-pi:mesh-batch" },
+      { laneId: "mesh-unsolicited", customType: "remote-pi:mesh-batch" },
+    ];
+    // The loop and watchdog share the bounded loop-tick batch. Lifecycle lane
+    // order keeps the completion, loop, and cron submits deterministic.
+    case "background-due-during-compaction": return [
+      { laneId: "background-notify", customType: "background-task-completion" },
+      { laneId: "loop-tick", customType: "loop-timer-tick" },
+      { laneId: "cron-tick", customType: "cron-timer-tick" },
+    ];
+    // Failure/attention has priority over successful subagent completion.
+    case "large-context-reduction": return [
+      { laneId: "failure-attention-decision", customType: "subagent-notify" },
+      { laneId: "subagent-success", customType: "subagent-notify" },
+      { laneId: "background-notify", customType: "background-task-completion" },
+    ];
+    default: return undefined;
   }
-  if (submissions.length !== ALL_PRODUCER_BATCHES.length) throw new Error(`all-producers submitted unexpected custom-message batches: ${submissions.length}`);
+}
+
+function assertAllProducerBatches(submissions: readonly Readonly<{ customType: string; sequence: number }>[], context: ExactCandidateScenarioContext): void {
+  assertExpectedProducerBatches(submissions, ALL_PRODUCER_BATCHES, context);
+}
+
+function assertExpectedProducerBatches(submissions: readonly Readonly<{ customType: string; sequence: number }>[], batches: readonly ExpectedProducerBatch[], context: ExactCandidateScenarioContext): void {
+  if (submissions.length !== batches.length) {
+    throw new Error(`${context.scenarioId} submitted ${submissions.length} producer batches; expected ${batches.length}`);
+  }
+  for (const [sequence, batch] of batches.entries()) {
+    const actual = submissions[sequence];
+    if (actual?.customType !== batch.customType || actual.sequence !== sequence) {
+      throw new Error(`${context.scenarioId} lane ${batch.laneId} expected ${batch.customType} at sequence ${sequence}, got ${actual?.customType ?? "none"} at ${actual?.sequence ?? -1}`);
+    }
+    context.timeline.record({ type: context.scenarioId === "all-producers-concurrent" ? "all-producers-batch-submitted" : "producer-batch-submitted", outcome: batch.laneId, count: 1, sequence });
+  }
 }
 
 function isOrdinaryProviderWork(label: DeferredProviderCall["label"]): boolean {
-  return label === "agent-initial" || label === "agent-post-tool" || label === "producer-drain";
+  return label === "agent-initial" || label === "agent-post-tool" || label === "producer-drain" || label === "pre-compaction-producer";
 }
 
 function injectionsFor(scenarioId: string, suffix: string): readonly ExactCandidateProbeInjection[] {
@@ -215,6 +246,8 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
     return blockForPublicSdkLimitation(context, "pi-0.80.6-public-AgentSession-exposes-auto-compaction-settings-but-no-supported-deterministic-overflow-injector-before-extension-preflight");
   }
   const provider = createDeferredFakeProvider();
+  const producerBatches = expectedProducerBatches(context.scenarioId);
+  const traceProducerReleases = producerBatches !== undefined;
   const traceAllProducers = context.scenarioId === "all-producers-concurrent";
   let compactionOpen = false;
   let resumeReleaseBarrier = false;
@@ -233,6 +266,12 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
       fauxToolCall("self_compact", { instructions: "joined managed request" }, { id: "self-compact-second" }),
     ]
     : [fauxToolCall("self_compact", { instructions: "reload durable state" }, { id: `self-compact-${context.scenarioId}` })];
+  // The production pi-subagents completion delivery starts a real parent turn.
+  // Queue its disposable response first, so the accepted before-compaction
+  // injection cannot consume the self_compact response below.
+  const preCompactionProducer = context.scenarioId === "subagent-before-during-after"
+    ? provider.enqueue(fauxAssistantMessage("Settling pre-compaction producer response."), { label: "pre-compaction-producer" })
+    : undefined;
   const first = provider.enqueue(fauxAssistantMessage(toolCalls, { stopReason: "toolUse" }), { label: "agent-initial" });
   const second = provider.enqueue(fauxAssistantMessage("Settling managed request."), { label: "agent-post-tool" });
   const history = providerFailure
@@ -243,11 +282,11 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
   // This repeating deferred response is deliberately bound to actual provider
   // entries. It avoids the invalid ingress=count(model-turn) assumption while
   // keeping every observed producer request held until the driver releases it.
-  const producerDrains: DeferredResponseSequence | undefined = traceAllProducers
+  const producerDrains: DeferredResponseSequence | undefined = traceProducerReleases
     ? provider.enqueueProducerDrain(fauxAssistantMessage("Settling producer drain."))
     : undefined;
   const unsubscribeProvider = provider.onEntry((entry) => {
-    if (traceAllProducers) context.timeline.record({ type: "all-producers-provider-entered", outcome: entry.label, count: provider.tracker.inFlight, sequence: entry.callCount });
+    if (traceProducerReleases) context.timeline.record({ type: traceAllProducers ? "all-producers-provider-entered" : "producer-provider-entered", outcome: entry.label, count: provider.tracker.inFlight, sequence: entry.callCount });
     if (compactionOpen && isOrdinaryProviderWork(entry.label)) providerInvariantError ??= new Error(`ordinary provider work entered during compaction: ${entry.label}`);
     if ((entry.label === "compaction-history" || entry.label === "compaction-turn") && !compactionOpen) providerInvariantError ??= new Error(`compaction summary entered outside compaction: ${entry.label}`);
     if (entry.label === "self-resume" && compactionOpen) providerInvariantError ??= new Error("self-resume provider work entered before compaction terminal");
@@ -334,7 +373,7 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
   let toolExecutionStarts = 0;
   let toolExecutionEnds = 0;
   let toolResultStarts = 0;
-  const allProducerCustomTypes = new Set(ALL_PRODUCER_BATCHES.map((batch) => batch.customType));
+  const producerCustomTypes = new Set(ALL_PRODUCER_BATCHES.map((batch) => batch.customType));
   const actualProducerSubmissions: Array<Readonly<{ customType: string; sequence: number }>> = [];
   let queuedSteering = 0;
   let queuedFollowUp = 0;
@@ -373,10 +412,10 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
     if (context.scenarioId === "tool-multi-tool" && toolExecutionStarts >= 2 && toolExecutionEnds >= 2 && toolResultStarts >= 2) {
       resolveMultiToolResults();
     }
-    if (event.type === "message_start" && event.message.role === "custom" && allProducerCustomTypes.has(event.message.customType)) {
+    if (traceProducerReleases && event.type === "message_start" && event.message.role === "custom" && producerCustomTypes.has(event.message.customType)) {
       const submission = Object.freeze({ customType: event.message.customType, sequence: actualProducerSubmissions.length });
       actualProducerSubmissions.push(submission);
-      if (traceAllProducers) context.timeline.record({ type: "all-producers-custom-message-submitted", outcome: submission.customType, count: actualProducerSubmissions.length, sequence: submission.sequence });
+      context.timeline.record({ type: traceAllProducers ? "all-producers-custom-message-submitted" : "producer-custom-message-submitted", outcome: submission.customType, count: actualProducerSubmissions.length, sequence: submission.sequence });
     }
     if (event.type === "compaction_end") {
       compactionEnds += 1;
@@ -393,9 +432,24 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
       probes.push(await loadExactCandidateProbe({ packageName, packageDirectory: packageDirectory(context, packageName), session, seed: context.seed }));
       context.timeline.record({ type: "consumer-probe-loaded", consumerId: packageName, count: probes.length });
     }
-    const beforeInjections = context.scenarioId === "subagent-before-during-after"
-      ? await inject(probes, [{ consumer: "pi-subagents", kind: "completion", id: "subagent-before-success", outcome: "success" }], context)
-      : [];
+    const beforeInjection = context.scenarioId === "subagent-before-during-after"
+      ? inject(probes, [{ consumer: "pi-subagents", kind: "completion", id: "subagent-before-success", outcome: "success" }], context)
+      : undefined;
+    if (preCompactionProducer !== undefined) {
+      const preCompactionCall = await waitFor(preCompactionProducer.call, "pre-compaction producer provider call");
+      context.timeline.record({ type: "pre-compaction-producer-entered", consumerId: "pi-subagents", count: preCompactionCall.callCount });
+      preCompactionProducer.release();
+      await waitFor(preCompactionProducer.completed, "pre-compaction producer terminal settlement");
+      await session.waitForIdle();
+      const preCompactionCalls = provider.tracker.calls();
+      const snapshot = getContextLifecycleSnapshotV1();
+      if (preCompactionCalls.length !== 1 || preCompactionCalls[0]?.label !== "pre-compaction-producer" || provider.tracker.inFlight !== 0 || provider.tracker.maxInFlight !== 1 || !session.isIdle || snapshot.phase !== "idle" || queuedSteering !== 0 || queuedFollowUp !== 0 || agentStartTotal !== agentSettledTotal || compactionStarts !== 0 || compactionEnds !== 0) {
+        throw new Error(`pre-compaction producer did not settle to an idle public boundary: calls=${preCompactionCalls.length} label=${preCompactionCalls[0]?.label ?? "none"} inFlight=${provider.tracker.inFlight} maxInFlight=${provider.tracker.maxInFlight} sessionIdle=${session.isIdle} phase=${snapshot.phase ?? "none"} steering=${queuedSteering} followUp=${queuedFollowUp} starts=${agentStartTotal} settlements=${agentSettledTotal} compactionStarts=${compactionStarts} compactionEnds=${compactionEnds}`);
+      }
+      provider.tracker.assertNoOverlap();
+      context.timeline.record({ type: "pre-compaction-producer-settled", consumerId: "pi-subagents", count: provider.tracker.completed });
+    }
+    const beforeInjections = beforeInjection === undefined ? [] : await beforeInjection;
     for (const receipt of beforeInjections) {
       if (receipt.receipt.outcome !== "accepted") throw new Error(`expected pre-compaction ${receipt.receipt.consumer}:${receipt.receipt.id} to be accepted, got ${receipt.receipt.outcome}`);
     }
@@ -453,7 +507,7 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
           if (afterBytes >= beforeBytes) throw new Error(`managed compaction did not reduce measured context bytes: before=${beforeBytes}, after=${afterBytes}`);
         }
         resumeReleaseBarrier = true;
-        if (producerDrains !== undefined) {
+        if (producerDrains !== undefined && producerBatches !== undefined) {
           const firstProducer = await producerDrains.responseAt(0);
           const releases = requireReleasedInOrder(probes, [...heldInjections, ...afterInjections], context);
           await waitFor(firstProducer.call, "first actual producer provider call");
@@ -461,49 +515,82 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
             throw providerInvariantError ?? new Error("a producer submission entered a second provider request while the first was held");
           }
           provider.tracker.assertNoOverlap();
-          await releases;
-          // Every held producer ingress has crossed its archive probe's real
-          // production release boundary while the first resulting provider
-          // request remains held. The probes deliberately do not fabricate
-          // per-turn counts or cross-consumer batch correlations.
-          // All lanes have acknowledged their finite-cut submissions while the
-          // first actual producer request remains held. A second entry here is
-          // an overlap, not merely nested public lifecycle events.
-          provider.tracker.assertNoOverlap();
           let producerIndex = 0;
           const drainDeadline = Date.now() + 10_000;
-          for (;;) {
-            const producerDrain = await producerDrains.responseAt(producerIndex);
-            await waitFor(producerDrain.call, `producer drain ${producerIndex} provider call`);
-            producerDrain.release();
-            await waitFor(producerDrain.completed, `producer drain ${producerIndex} completion`);
-            const next = await producerDrains.responseAt(producerIndex + 1);
-            let nextEntered = false;
-            while (!nextEntered && Date.now() < drainDeadline) {
-              nextEntered = await Promise.race([
-                next.call.then(() => true),
-                new Promise<false>((resolve) => setTimeout(() => resolve(false), actualProducerSubmissions.length === ALL_PRODUCER_BATCHES.length ? 50 : 10)),
-              ]);
-              if (actualProducerSubmissions.length === ALL_PRODUCER_BATCHES.length && !nextEntered) break;
+          if (traceAllProducers) {
+            // The all-producer finite-cut proof additionally establishes that
+            // all release receipts can arrive while the first real producer
+            // request stays held.
+            await releases;
+            provider.tracker.assertNoOverlap();
+            for (;;) {
+              const producerDrain = await producerDrains.responseAt(producerIndex);
+              await waitFor(producerDrain.call, `producer drain ${producerIndex} provider call`);
+              producerDrain.release();
+              await waitFor(producerDrain.completed, `producer drain ${producerIndex} completion`);
+              const next = await producerDrains.responseAt(producerIndex + 1);
+              let nextEntered = false;
+              while (!nextEntered && Date.now() < drainDeadline) {
+                nextEntered = await Promise.race([
+                  next.call.then(() => true),
+                  new Promise<false>((resolve) => setTimeout(resolve, actualProducerSubmissions.length === producerBatches.length ? 50 : 10)),
+                ]);
+                if (actualProducerSubmissions.length === producerBatches.length && !nextEntered) break;
+              }
+              if (nextEntered) {
+                producerIndex += 1;
+                continue;
+              }
+              if (actualProducerSubmissions.length !== producerBatches.length) {
+                throw new Error(`${context.scenarioId} did not expose all expected producer batches before quiescence: observed=${actualProducerSubmissions.length} expected=${producerBatches.length}`);
+              }
+              break;
             }
-            if (nextEntered) {
-              producerIndex += 1;
-              continue;
+          } else {
+            // These real adapters can await the preceding follow-up turn
+            // before they acknowledge the next release. Settle each observed
+            // public stream in order; do not hold an earlier response and
+            // deadlock the later production drainer.
+            const releaseStates = new Set<"completed" | "failed">();
+            // Observe rejection now so a failing archive receipt cannot become
+            // an unhandled rejection while the bounded stream driver waits.
+            void releases.then(() => { releaseStates.add("completed"); }, () => { releaseStates.add("failed"); });
+            drainReleasedStreams: for (;;) {
+              const producerDrain = await producerDrains.responseAt(producerIndex);
+              await waitFor(producerDrain.call, `producer drain ${producerIndex} provider call`);
+              producerDrain.release();
+              await waitFor(producerDrain.completed, `producer drain ${producerIndex} completion`);
+              const next = await producerDrains.responseAt(producerIndex + 1);
+              for (;;) {
+                if (Date.now() >= drainDeadline) {
+                  throw new Error(`${context.scenarioId} did not expose all expected producer batches/releases before quiescence: observed=${actualProducerSubmissions.length} expected=${producerBatches.length} releaseState=${[...releaseStates].join(",") || "pending"}`);
+                }
+                const nextEntered = await Promise.race([
+                  next.call.then(() => true),
+                  new Promise<false>((resolve) => setTimeout(resolve, releaseStates.has("completed") && actualProducerSubmissions.length === producerBatches.length ? 50 : 10)),
+                ]);
+                if (nextEntered) {
+                  producerIndex += 1;
+                  continue drainReleasedStreams;
+                }
+                if (releaseStates.has("failed")) await releases;
+                if (releaseStates.has("completed") && actualProducerSubmissions.length === producerBatches.length) {
+                  await releases;
+                  break drainReleasedStreams;
+                }
+              }
             }
-            if (actualProducerSubmissions.length !== ALL_PRODUCER_BATCHES.length) {
-              throw new Error(`all-producers did not expose all expected custom-message batches before quiescence: observed=${actualProducerSubmissions.length}`);
-            }
-            break;
           }
-          await session.waitForIdle();
+          await waitFor(session.waitForIdle(), `${context.scenarioId} final release quiescence`);
           await new Promise<void>((resolve) => setImmediate(resolve));
           await new Promise<void>((resolve) => setImmediate(resolve));
-          assertAllProducerBatches(actualProducerSubmissions, context);
+          if (traceAllProducers) assertAllProducerBatches(actualProducerSubmissions, context);
+          else assertExpectedProducerBatches(actualProducerSubmissions, producerBatches, context);
           const snapshot = getContextLifecycleSnapshotV1();
-          if (!session.isIdle || snapshot.phase !== "idle" || queuedSteering !== 0 || queuedFollowUp !== 0) {
-            throw new Error(`all-producers did not reach final lifecycle/session quiescence: sessionIdle=${session.isIdle} phase=${snapshot.phase ?? "none"} steering=${queuedSteering} followUp=${queuedFollowUp}`);
+          if (!session.isIdle || snapshot.phase !== "idle" || queuedSteering !== 0 || queuedFollowUp !== 0 || agentStartTotal !== agentSettledTotal) {
+            throw new Error(`${context.scenarioId} did not reach final lifecycle/session quiescence: sessionIdle=${session.isIdle} phase=${snapshot.phase ?? "none"} steering=${queuedSteering} followUp=${queuedFollowUp} starts=${agentStartTotal} settlements=${agentSettledTotal}`);
           }
-          context.timeline.record({ type: "all-producers-final-quiescence", count: provider.tracker.completed, sequence: agentSettledTotal });
+          context.timeline.record({ type: traceAllProducers ? "all-producers-final-quiescence" : "producer-final-quiescence", count: provider.tracker.completed, sequence: agentSettledTotal });
         } else {
           await requireReleasedInOrder(probes, [...heldInjections, ...afterInjections], context);
         }
