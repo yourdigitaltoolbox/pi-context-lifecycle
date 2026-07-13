@@ -1,11 +1,14 @@
 import {
   AuthStorage,
-  createAgentSession,
-  DefaultResourceLoader,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
   ModelRegistry,
   SessionManager,
   SettingsManager,
+  type CreateAgentSessionRuntimeFactory,
   type AgentSessionEvent,
+  type AgentSessionRuntime,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
@@ -21,8 +24,9 @@ function packageDirectory(context: ExactCandidateScenarioContext, packageName: E
   return directory;
 }
 
-function providerExtension(provider: ReturnType<typeof createDeferredFakeProvider>): (pi: ExtensionAPI) => void {
+function providerExtension(provider: ReturnType<typeof createDeferredFakeProvider>, onSessionShutdown?: () => void): (pi: ExtensionAPI) => void {
   return (pi) => {
+    if (onSessionShutdown !== undefined) pi.on("session_shutdown", onSessionShutdown);
     pi.registerProvider(provider.provider, {
       api: provider.api,
       apiKey: "disposable-test-key",
@@ -84,6 +88,18 @@ async function disposeProbes(probes: readonly ExactCandidateProbe[]): Promise<vo
   await Promise.all([...probes].reverse().map(async (probe) => probe.dispose()));
 }
 
+async function disposeScenarioRuntime(runtime: AgentSessionRuntime, probes: readonly ExactCandidateProbe[], getSessionShutdownCount: () => number): Promise<void> {
+  try {
+    // AgentSessionRuntime is the documented host that emits session_shutdown
+    // and awaits archive extension cleanup before invalidating its session.
+    await runtime.dispose();
+  } finally {
+    await disposeProbes(probes);
+  }
+  const sessionShutdownCount = getSessionShutdownCount();
+  if (sessionShutdownCount !== 1) throw new Error(`expected one runtime session_shutdown, got ${sessionShutdownCount}`);
+}
+
 /**
  * Runs one packaged managed-compaction race through the documented SDK session
  * surface. All candidate extensions are discovered from the disposable project
@@ -105,35 +121,51 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
     packages: Object.values(context.packageDirectories),
     compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_000 },
   }, { projectTrusted: true });
-  const loader = new DefaultResourceLoader({
-    cwd: context.runtimeRoot,
-    agentDir: context.roots.agentDir,
-    settingsManager,
-    extensionFactories: [providerExtension(provider)],
-  });
-  await loader.reload({ resolveProjectTrust: () => Promise.resolve(true) });
-  const extensions = loader.getExtensions().extensions;
-  const candidateExtensions = extensions.filter((extension) => extension.path.startsWith(context.runtimeRoot));
-  if (candidateExtensions.length < 4 || extensions.some((extension) => !extension.path.startsWith(context.runtimeRoot) && !extension.path.startsWith("<inline:"))) {
-    throw new Error("candidate package extensions did not load exclusively from the archive runtime");
-  }
-  context.timeline.record({ type: "archive-extensions-loaded", count: candidateExtensions.length });
   const sessionManager = SessionManager.create(context.runtimeRoot, context.roots.sessions);
   for (let index = 0; index < 5; index += 1) {
     sessionManager.appendMessage({ role: "user", content: `candidate-history-${index} ${"u".repeat(4_000)}`, timestamp: Date.now() });
     sessionManager.appendMessage(fauxAssistantMessage(`candidate-response-${index} ${"a".repeat(4_000)}`));
   }
-  const { session } = await createAgentSession({
+  let sessionShutdownCount = 0;
+  const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager: targetSessionManager, sessionStartEvent }) => {
+    const services = await createAgentSessionServices({
+      cwd,
+      agentDir,
+      authStorage,
+      modelRegistry,
+      settingsManager,
+      resourceLoaderOptions: {
+        extensionFactories: [providerExtension(provider, () => {
+          sessionShutdownCount += 1;
+          context.timeline.record({ type: "runtime-session-shutdown", count: sessionShutdownCount });
+        })],
+      },
+      resourceLoaderReloadOptions: { resolveProjectTrust: () => Promise.resolve(true) },
+    });
+    return {
+      ...(await createAgentSessionFromServices({
+        services,
+        sessionManager: targetSessionManager,
+        ...(sessionStartEvent === undefined ? {} : { sessionStartEvent }),
+        model: provider.getModel(),
+        tools: ["self_compact"],
+      })),
+      services,
+      diagnostics: services.diagnostics,
+    };
+  };
+  const runtime = await createAgentSessionRuntime(createRuntime, {
     cwd: context.runtimeRoot,
     agentDir: context.roots.agentDir,
-    authStorage,
-    modelRegistry,
-    settingsManager,
-    resourceLoader: loader,
     sessionManager,
-    model: provider.getModel(),
-    tools: ["self_compact"],
   });
+  const extensions = runtime.services.resourceLoader.getExtensions().extensions;
+  const candidateExtensions = extensions.filter((extension) => extension.path.startsWith(context.runtimeRoot));
+  if (candidateExtensions.length < 4 || extensions.some((extension) => !extension.path.startsWith(context.runtimeRoot) && !extension.path.startsWith("<inline:"))) {
+    throw new Error("candidate package extensions did not load exclusively from the archive runtime");
+  }
+  context.timeline.record({ type: "archive-extensions-loaded", count: candidateExtensions.length });
+  const session = runtime.session;
   const probes: ExactCandidateProbe[] = [];
   let activeRuns = 0;
   let maxActiveRuns = 0;
@@ -195,8 +227,7 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
     }
   } finally {
     unsubscribe();
-    await disposeProbes(probes);
-    session.dispose();
+    await disposeScenarioRuntime(runtime, probes, () => sessionShutdownCount);
   }
 }
 
