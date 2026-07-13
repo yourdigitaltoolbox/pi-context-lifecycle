@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { getContextLifecycleSnapshotV1 } from "../registry.js";
+import { CONTEXT_LIFECYCLE_RELEASE_LANES, type LifecycleLane } from "../types.js";
 import { createDeferredFakeProvider, type DeferredProviderCall, type DeferredResponseSequence } from "./deferred-provider.js";
 import { loadExactCandidateProbe, type ExactCandidateConsumer, type ExactCandidateProbe, type ExactCandidateProbeInjection, type ExactCandidateProbeReceipt } from "./exact-candidate-probe.js";
 import type { ExactCandidateScenarioContext } from "./exact-candidate.js";
@@ -63,8 +64,70 @@ async function waitFor<T>(promise: Promise<T>, label: string): Promise<T> {
 }
 
 interface ExpectedProducerBatch {
-  readonly laneId: string;
+  readonly laneId: LifecycleLane;
   readonly customType: string;
+}
+
+export interface ProductionReleaseLaneExpectation {
+  readonly consumer: ExactCandidateConsumer;
+  readonly id: string;
+  readonly laneId: LifecycleLane;
+}
+
+const LANE_ORDER = new Map<LifecycleLane, number>(CONTEXT_LIFECYCLE_RELEASE_LANES.map((laneId, index) => [laneId, index]));
+
+function receiptLaneId(receipt: Readonly<ExactCandidateProbeReceipt>): LifecycleLane | undefined {
+  return receipt.laneId ?? receipt.lane;
+}
+
+function expectedReceiptLane(input: ExactCandidateProbeInjection): LifecycleLane | undefined {
+  if (input.consumer === "pi-subagents") return input.outcome === "failure" ? "failure-attention-decision" : "subagent-success";
+  if (input.consumer === "remote-pi" && input.kind === "mesh-arrival") return input.lane === "reply" ? "mesh-reply" : "mesh-unsolicited";
+  return undefined;
+}
+
+/**
+ * Verifies lane ordering from the consumer's redacted production release
+ * receipts. Custom-message types are deliberately absent: reply/unsolicited
+ * mesh and failure/success subagent batches share a type and cannot prove this.
+ */
+export function assertProductionReleaseLaneOrder(
+  observations: readonly Readonly<ExactCandidateProbeReceipt>[],
+  expected: readonly ProductionReleaseLaneExpectation[],
+): readonly Readonly<ExactCandidateProbeReceipt>[] {
+  const orderedEvidence: Readonly<ExactCandidateProbeReceipt>[] = [];
+  for (const consumer of consumerPackageNames) {
+    const expectedForConsumer = expected
+      .filter((entry) => entry.consumer === consumer)
+      .sort((left, right) => (LANE_ORDER.get(left.laneId) ?? Number.MAX_SAFE_INTEGER) - (LANE_ORDER.get(right.laneId) ?? Number.MAX_SAFE_INTEGER));
+    if (expectedForConsumer.length === 0) continue;
+    const expectedIds = new Set(expectedForConsumer.map((entry) => entry.id));
+    const released = observations.filter((entry) => entry.consumer === consumer && entry.outcome === "released" && expectedIds.has(entry.id));
+    if (released.length !== expectedForConsumer.length) {
+      throw new Error(`${consumer} produced ${released.length} redacted release receipts; expected ${expectedForConsumer.length}`);
+    }
+    // pi-subagents acknowledges its real public send asynchronously. Its
+    // receipt's production dispatch sequence, rather than Promise-settlement
+    // arrival order, is the redacted ordering witness for shared custom types.
+    const orderedReleased = consumer === "pi-subagents"
+      ? released.map((receipt) => {
+        const dispatchSequence = receipt.dispatchSequence;
+        if (typeof dispatchSequence !== "number" || !Number.isSafeInteger(dispatchSequence) || dispatchSequence < 0) {
+          throw new Error(`${consumer} redacted release receipt lacks a dispatchSequence`);
+        }
+        return receipt;
+      }).sort((left, right) => (left.dispatchSequence ?? -1) - (right.dispatchSequence ?? -1))
+      : released;
+    for (const [sequence, expectedReceipt] of expectedForConsumer.entries()) {
+      const actual = orderedReleased[sequence];
+      const actualLaneId = actual === undefined ? undefined : receiptLaneId(actual);
+      if (actualLaneId !== expectedReceipt.laneId) {
+        throw new Error(`${consumer} redacted release receipt ${sequence} expected lane ${expectedReceipt.laneId}, got ${actualLaneId ?? "none"}`);
+      }
+    }
+    orderedEvidence.push(...orderedReleased);
+  }
+  return Object.freeze(orderedEvidence);
 }
 
 const ALL_PRODUCER_BATCHES: readonly ExpectedProducerBatch[] = [
@@ -78,6 +141,12 @@ const ALL_PRODUCER_BATCHES: readonly ExpectedProducerBatch[] = [
 function expectedProducerBatches(scenarioId: string): readonly ExpectedProducerBatch[] | undefined {
   switch (scenarioId) {
     case "all-producers-concurrent": return ALL_PRODUCER_BATCHES;
+    // The two success completions share one production subagent-success batch,
+    // while failure is emitted through its earlier lifecycle lane.
+    case "subagent-before-during-after": return [
+      { laneId: "failure-attention-decision", customType: "subagent-notify" },
+      { laneId: "subagent-success", customType: "subagent-notify" },
+    ];
     // MeshSpool releases reply before unsolicited traffic, each through its
     // production follow-up submission boundary.
     case "mesh-during-compaction": return [
@@ -193,6 +262,21 @@ async function requireReleasedInOrder(probes: readonly ExactCandidateProbe[], re
       throw new Error(`archive probe did not prove held/released disposition for ${injected.receipt.consumer}:${injected.receipt.id}`);
     }
     context.timeline.record({ type: "consumer-release-observed", consumerId: injected.receipt.consumer, outcome: "released", sequence: releasedAt });
+  }
+  const expectedLaneReceipts = receipts.flatMap((injected): readonly ProductionReleaseLaneExpectation[] => {
+    const laneId = expectedReceiptLane(injected.input);
+    return laneId === undefined ? [] : [{ consumer: injected.receipt.consumer, id: injected.receipt.id, laneId }];
+  });
+  const allObservations = (await Promise.all(probes.map(async (probe) => probe.observations()))).flat();
+  for (const receipt of allObservations) {
+    if (receipt.outcome !== "released" || !expectedLaneReceipts.some((expected) => expected.consumer === receipt.consumer && expected.id === receipt.id)) continue;
+    context.timeline.record({ type: "consumer-release-receipt-observed", consumerId: receipt.consumer, outcome: receiptLaneId(receipt) ?? "lane-missing", ...(receipt.dispatchSequence === undefined ? {} : { sequence: receipt.dispatchSequence }) });
+  }
+  const orderedEvidence = assertProductionReleaseLaneOrder(allObservations, expectedLaneReceipts);
+  for (const receipt of orderedEvidence) {
+    const laneId = receiptLaneId(receipt);
+    if (laneId === undefined) throw new Error(`${receipt.consumer} ordered release evidence lacks a lane`);
+    context.timeline.record({ type: "consumer-release-lane-observed", consumerId: receipt.consumer, outcome: laneId, ...(receipt.dispatchSequence === undefined ? {} : { sequence: receipt.dispatchSequence }) });
   }
 }
 
@@ -447,6 +531,10 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
         throw new Error(`pre-compaction producer did not settle to an idle public boundary: calls=${preCompactionCalls.length} label=${preCompactionCalls[0]?.label ?? "none"} inFlight=${provider.tracker.inFlight} maxInFlight=${provider.tracker.maxInFlight} sessionIdle=${session.isIdle} phase=${snapshot.phase ?? "none"} steering=${queuedSteering} followUp=${queuedFollowUp} starts=${agentStartTotal} settlements=${agentSettledTotal} compactionStarts=${compactionStarts} compactionEnds=${compactionEnds}`);
       }
       provider.tracker.assertNoOverlap();
+      // This accepted pre-compaction notification establishes the ordinary
+      // parent-turn boundary only. Post-resume batch assertions must count
+      // solely the two held-during and one held-after completions below.
+      actualProducerSubmissions.length = 0;
       context.timeline.record({ type: "pre-compaction-producer-settled", consumerId: "pi-subagents", count: provider.tracker.completed });
     }
     const beforeInjections = beforeInjection === undefined ? [] : await beforeInjection;

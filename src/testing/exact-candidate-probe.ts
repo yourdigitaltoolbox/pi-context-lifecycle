@@ -2,6 +2,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { LifecycleLane } from "../types.js";
 
 export type ExactCandidateConsumer = "pi-subagents" | "remote-pi" | "pi-background-tasks";
 
@@ -15,6 +16,15 @@ export interface ExactCandidateProbeReceipt {
   consumer: ExactCandidateConsumer;
   id: string;
   outcome: "accepted" | "held" | "released" | "coalesced" | "rejected" | "completed" | "failed";
+  /** Canonical redacted lifecycle lane on production held/released receipts. */
+  laneId?: LifecycleLane;
+  /** Remote Pi's current packaged probe spelling, normalized by the matrix. */
+  lane?: LifecycleLane;
+  /**
+   * Redacted monotonic production dispatch ordering. A consumer may attach it
+   * when receipt delivery is asynchronous with respect to its real submit.
+   */
+  dispatchSequence?: number;
   operationId?: string;
   generationId?: string;
   notificationCount?: number;
