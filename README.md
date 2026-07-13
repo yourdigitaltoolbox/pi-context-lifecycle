@@ -101,7 +101,7 @@ Run a retained external candidate with:
 npm run test:exact-candidate -- --manifest "$CANDIDATE_ROOT/candidate-manifest.json" --candidate-root "$CANDIDATE_ROOT" --seed 6607 --cycles 100 --max-duration-ms 3600000 --write-receipts "$CANDIDATE_ROOT/receipts" --rollback-rehearsal
 ```
 
-The command fails closed on any package-load, probe, scenario, soak, or rollback failure. It does not report a partial matrix as a candidate verdict.
+The command fails closed on any package-load, probe, scenario, soak, or rollback failure. It does not report a partial matrix as a candidate verdict. For a one-scenario diagnostic, add `--scenario tool-multi-tool`; it skips the soak and returns `status: "partial"`, which is not a candidate verdict.
 
 The manifest validator requires full commit/tree identities, SHA-256 archive/lock digests, exact Pi version/integrity, a deterministic scenario seed, relative archive paths, and a complete unique package order. Candidate-specific values and outputs remain outside lifecycle source so they cannot create a self-referential commit identity.
 

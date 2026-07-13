@@ -53,7 +53,7 @@ export interface SoakReceipt {
   seed: string | number;
   requestedCycles: number;
   completedCycles: number;
-  status: "passed" | "failed" | "deadline-exceeded";
+  status: "passed" | "failed" | "deadline-exceeded" | "skipped";
   failureCycle?: number;
   startedAt: number;
   completedAt: number;

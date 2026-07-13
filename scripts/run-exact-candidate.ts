@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 type TestingModule = typeof import("../src/testing/index.js");
+type ExactCandidateScenarioId = import("../src/testing/index.js").ExactCandidateScenarioId;
 
 interface Arguments {
   candidateRoot: string;
@@ -12,10 +13,11 @@ interface Arguments {
   maxDurationMs?: number;
   rollbackRehearsal: boolean;
   writeReceipts?: string;
+  scenario?: string;
 }
 
 function usage(): never {
-  throw new Error("usage: npm run test:exact-candidate -- --manifest <candidate-manifest.json> --candidate-root <external-root> [--seed <seed>] [--cycles <1-10000>] [--max-duration-ms <ms>] [--write-receipts <external-dir>] [--rollback-rehearsal]");
+  throw new Error("usage: npm run test:exact-candidate -- --manifest <candidate-manifest.json> --candidate-root <external-root> [--seed <seed>] [--cycles <1-10000>] [--max-duration-ms <ms>] [--write-receipts <external-dir>] [--scenario <layer-3-scenario-id>] [--rollback-rehearsal]");
 }
 
 function parseArguments(argv: readonly string[]): Arguments {
@@ -24,7 +26,7 @@ function parseArguments(argv: readonly string[]): Arguments {
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--rollback-rehearsal") { rollbackRehearsal = true; continue; }
-    if (argument === undefined || !["--manifest", "--candidate-root", "--seed", "--cycles", "--max-duration-ms", "--write-receipts"].includes(argument)) usage();
+    if (argument === undefined || !["--manifest", "--candidate-root", "--seed", "--cycles", "--max-duration-ms", "--write-receipts", "--scenario"].includes(argument)) usage();
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--") || values.has(argument)) usage();
     values.set(argument, value);
@@ -44,6 +46,7 @@ function parseArguments(argv: readonly string[]): Arguments {
   const cycles = parseBoundedInteger("--cycles");
   const maxDurationMs = parseBoundedInteger("--max-duration-ms");
   const writeReceipts = values.get("--write-receipts");
+  const scenario = values.get("--scenario");
   return {
     candidateRoot,
     manifest,
@@ -51,6 +54,7 @@ function parseArguments(argv: readonly string[]): Arguments {
     ...(cycles === undefined ? {} : { cycles }),
     ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
     ...(writeReceipts === undefined ? {} : { writeReceipts }),
+    ...(scenario === undefined ? {} : { scenario }),
     rollbackRehearsal,
   };
 }
@@ -66,6 +70,7 @@ const receipt = await testing.runExactCandidate({
   ...(args.cycles === undefined ? {} : { cycles: args.cycles }),
   ...(args.maxDurationMs === undefined ? {} : { maxDurationMs: args.maxDurationMs }),
   ...(args.writeReceipts === undefined ? {} : { writeReceipts: args.writeReceipts }),
+  ...(args.scenario === undefined ? {} : { scenarioIds: [args.scenario as ExactCandidateScenarioId] }),
   rollbackRehearsal: args.rollbackRehearsal,
 });
 process.stdout.write(`${JSON.stringify({ status: receipt.status, scenarios: receipt.scenarios.length, completedCycles: receipt.soak.completedCycles, rollback: receipt.rollback?.status ?? "not-requested" })}\n`);

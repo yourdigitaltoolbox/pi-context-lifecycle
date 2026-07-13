@@ -95,6 +95,26 @@ describe("exact candidate runner", () => {
     }
   });
 
+  it("runs an explicitly selected scenario without presenting it as a full candidate verdict or running the soak", async () => {
+    const root = await candidateRoot();
+    const seenScenarios: string[] = [];
+    try {
+      const receipt = await runExactCandidate({
+        candidateRoot: root,
+        manifestPath: join(root, "candidate-manifest.json"),
+        piCommand: "pi",
+        scenarioIds: ["tool-multi-tool"],
+        runner: archiveInstaller(),
+        executeScenario(context) { seenScenarios.push(context.scenarioId); },
+        runSoakCycle() { throw new Error("selected scenario diagnostic must not run the soak"); },
+      });
+      expect(seenScenarios).toEqual(["tool-multi-tool"]);
+      expect(receipt).toMatchObject({ status: "partial", partialScenarioIds: ["tool-multi-tool"], soak: { status: "skipped", completedCycles: 0 } });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an archive outside the candidate root before invoking npm", async () => {
     const root = await candidateRoot();
     let runs = 0;

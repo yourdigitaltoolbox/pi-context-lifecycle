@@ -87,7 +87,9 @@ export interface ExactCandidateReceipt {
   scenarios: readonly Readonly<ScenarioReceipt>[];
   soak: Readonly<SoakReceipt>;
   rollback?: Readonly<ExactCandidateRollbackReceipt>;
-  status: "passed";
+  /** A selected-scenario diagnostic run is never a full candidate verdict. */
+  partialScenarioIds?: readonly ExactCandidateScenarioId[];
+  status: "passed" | "partial";
 }
 
 export interface ExactCandidateRollbackReceipt {
@@ -172,6 +174,8 @@ export async function runExactCandidate(options: {
   maxDurationMs?: number;
   rollbackRehearsal?: boolean;
   writeReceipts?: string;
+  /** Limits a diagnostic run to named Layer-3 scenarios and skips the soak. */
+  scenarioIds?: readonly ExactCandidateScenarioId[];
   runner?: ExactCandidateCommandRunner;
   executeScenario?(context: ExactCandidateScenarioContext): Promise<void> | void;
   runSoakCycle?(context: ExactCandidateScenarioContext, cycle: number): Promise<void> | void;
@@ -188,6 +192,11 @@ export async function runExactCandidate(options: {
   const seed = options.seed ?? manifest.scenario.seed;
   const cycles = options.cycles ?? 100;
   const maxDurationMs = options.maxDurationMs ?? 60 * 60 * 1000;
+  const scenarioIds = options.scenarioIds === undefined ? EXACT_CANDIDATE_SCENARIOS : options.scenarioIds;
+  if (scenarioIds.length === 0 || new Set(scenarioIds).size !== scenarioIds.length || scenarioIds.some((scenarioId) => !EXACT_CANDIDATE_SCENARIOS.includes(scenarioId))) {
+    throw new Error("exact candidate scenarioIds must be a unique non-empty subset of the Layer-3 matrix");
+  }
+  const partialRun = options.scenarioIds !== undefined;
   const receiptsRoot = options.writeReceipts === undefined ? undefined : containedPath(candidateRoot, options.writeReceipts, "receipt directory");
   const runtimeRoot = join(candidateRoot, "runtime");
   const settingsPath = join(runtimeRoot, ".pi", "settings.json");
@@ -244,7 +253,7 @@ export async function runExactCandidate(options: {
         manualCharacterization: scenarioId === "manual-compact-characterization",
       });
       const scenarios: ScenarioReceipt[] = [];
-      for (const scenarioId of EXACT_CANDIDATE_SCENARIOS) {
+      for (const scenarioId of scenarioIds) {
         const receipt = await runScenario({
           scenarioId,
           seed,
@@ -256,20 +265,30 @@ export async function runExactCandidate(options: {
         }
         scenarios.push(receipt);
       }
-      const soak = await runBoundedSoak({
-        cycles,
-        seed,
-        maxDurationMs,
-        async runCycle(cycle) {
-          const context = createContext("soak", {
-            scenarioId: "soak",
-            seed,
-            timeline: createStructuredTimeline({ scenarioId: "soak", seed }),
-          });
-          await runSoakCycle(context, cycle);
-        },
-      });
-      if (soak.status !== "passed") {
+      const soak = partialRun
+        ? Object.freeze({
+          schemaVersion: 1 as const,
+          seed,
+          requestedCycles: 0,
+          completedCycles: 0,
+          status: "skipped" as const,
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+        })
+        : await runBoundedSoak({
+          cycles,
+          seed,
+          maxDurationMs,
+          async runCycle(cycle) {
+            const context = createContext("soak", {
+              scenarioId: "soak",
+              seed,
+              timeline: createStructuredTimeline({ scenarioId: "soak", seed }),
+            });
+            await runSoakCycle(context, cycle);
+          },
+        });
+      if (soak.status !== "passed" && soak.status !== "skipped") {
         if (receiptsRoot !== undefined) await writeFile(join(receiptsRoot, "exact-candidate-failure-receipt.json"), `${JSON.stringify({ schemaVersion: 1, manifestSha256, seed, status: soak.status, soak }, null, 2)}\n`);
         throw new Error(`exact candidate soak did not pass: ${soak.status}`);
       }
@@ -305,7 +324,7 @@ export async function runExactCandidate(options: {
         scenarios: Object.freeze(scenarios),
         soak,
         ...(rollback === undefined ? {} : { rollback }),
-        status: "passed",
+        ...(partialRun ? { partialScenarioIds: Object.freeze([...scenarioIds]), status: "partial" as const } : { status: "passed" as const }),
       });
       if (receiptsRoot !== undefined) await writeFile(join(receiptsRoot, "exact-candidate-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
       completedReceipt = receipt;
