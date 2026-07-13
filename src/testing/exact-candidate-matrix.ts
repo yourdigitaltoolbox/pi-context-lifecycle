@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import {
   AuthStorage,
   createAgentSessionFromServices,
@@ -160,8 +161,12 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
     sessionManager,
   });
   const extensions = runtime.services.resourceLoader.getExtensions().extensions;
-  const candidateExtensions = extensions.filter((extension) => extension.path.startsWith(context.runtimeRoot));
-  if (candidateExtensions.length < 4 || extensions.some((extension) => !extension.path.startsWith(context.runtimeRoot) && !extension.path.startsWith("<inline:"))) {
+  // Package loading canonicalizes macOS /tmp to /private/tmp. Compare the
+  // archive runtime's canonical root so the external-root boundary remains
+  // strict without rejecting its own archive extensions.
+  const actualRuntimeRoot = await realpath(context.runtimeRoot);
+  const candidateExtensions = extensions.filter((extension) => extension.path.startsWith(actualRuntimeRoot));
+  if (candidateExtensions.length < 4 || extensions.some((extension) => !extension.path.startsWith(actualRuntimeRoot) && !extension.path.startsWith("<inline:"))) {
     throw new Error("candidate package extensions did not load exclusively from the archive runtime");
   }
   context.timeline.record({ type: "archive-extensions-loaded", count: candidateExtensions.length });
