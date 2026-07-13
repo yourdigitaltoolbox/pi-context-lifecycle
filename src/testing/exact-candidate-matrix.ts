@@ -114,9 +114,20 @@ async function requireReleasedInOrder(probes: readonly ExactCandidateProbe[], re
     if (injected.input.consumer === "remote-pi" && injected.input.kind === "compact-request") continue;
     const probe = probes.find((candidate) => candidate.consumer === injected.receipt.consumer);
     if (probe === undefined) throw new Error(`candidate probe unavailable for ${injected.receipt.consumer}`);
-    const observations = await probe.observations();
-    const heldAt = observations.findIndex((entry) => entry.id === injected.receipt.id && entry.outcome === "held");
-    const releasedAt = observations.findIndex((entry, index) => index > heldAt && entry.id === injected.receipt.id && entry.outcome === "released");
+    // `agent_settled` is observed synchronously by the test subscriber, while
+    // the archive lifecycle extension starts its documented asynchronous
+    // drainer release from that same event. Wait for the probe's real release
+    // receipt rather than treating the subscriber observation as completion.
+    const deadline = Date.now() + 10_000;
+    let observations = await probe.observations();
+    let heldAt = observations.findIndex((entry) => entry.id === injected.receipt.id && entry.outcome === "held");
+    let releasedAt = observations.findIndex((entry, index) => index > heldAt && entry.id === injected.receipt.id && entry.outcome === "released");
+    while ((heldAt < 0 || releasedAt < 0) && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      observations = await probe.observations();
+      heldAt = observations.findIndex((entry) => entry.id === injected.receipt.id && entry.outcome === "held");
+      releasedAt = observations.findIndex((entry, index) => index > heldAt && entry.id === injected.receipt.id && entry.outcome === "released");
+    }
     if (heldAt < 0 || releasedAt < 0) {
       throw new Error(`archive probe did not prove held/released disposition for ${injected.receipt.consumer}:${injected.receipt.id}`);
     }
