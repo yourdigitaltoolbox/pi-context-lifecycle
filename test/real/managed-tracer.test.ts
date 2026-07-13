@@ -48,6 +48,76 @@ function textContent(content: unknown): string | undefined {
 describe("public SDK managed tracer", () => {
   afterEach(() => { Reflect.deleteProperty(globalThis, CONTEXT_LIFECYCLE_REGISTRY_SYMBOL); });
 
+  it("characterizes nested public settlement envelopes while provider requests remain serialized", async () => {
+    const roots = await createDisposableHarnessRoots();
+    try {
+      await withDisposableHarnessEnvironment(roots, async () => {
+        const provider = createDeferredFakeProvider();
+        const first = provider.enqueue(fauxAssistantMessage("initial"), { label: "agent-initial" });
+        const producerDrains = provider.enqueueProducerDrain(fauxAssistantMessage("follow-up"));
+        const followUp = await producerDrains.responseAt(0);
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        const settingsManager = SettingsManager.inMemory();
+        let sentFollowUp = false;
+        const providerExtension = (pi: ExtensionAPI) => {
+          pi.on("agent_settled", () => {
+            if (sentFollowUp) return;
+            sentFollowUp = true;
+            pi.sendMessage({ customType: "nested-public-event-characterization", content: "redacted", display: false }, { triggerTurn: true, deliverAs: "followUp" });
+          });
+          pi.registerProvider(provider.provider, {
+            api: provider.api,
+            apiKey: "disposable-test-key",
+            baseUrl: "http://localhost.invalid",
+            models: provider.models.map((model) => ({ id: model.id, name: model.name, api: model.api, reasoning: model.reasoning, input: model.input, cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens })),
+            streamSimple: (model, context, options) => provider.streamSimple(model, context, options),
+          });
+        };
+        const loader = new DefaultResourceLoader({ cwd: roots.cwd, agentDir: roots.agentDir, settingsManager, extensionFactories: [providerExtension] });
+        await loader.reload();
+        const { session } = await createAgentSession({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          sessionManager: SessionManager.create(roots.cwd, roots.sessions),
+          model: provider.getModel(),
+          tools: [],
+        });
+        await session.bindExtensions({ mode: "print" });
+        const events: string[] = [];
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "agent_start") events.push("start");
+          if (event.type === "agent_settled") events.push("settled");
+        });
+        try {
+          const prompt = session.prompt("initial request");
+          await first.call;
+          first.release();
+          await followUp.call;
+          // Pi emits the outer settlement after its extension handler, so the
+          // second public start nests before that outer settlement while only
+          // one labelled provider request is in flight.
+          expect(events).toEqual(["start", "start", "settled"]);
+          expect(provider.tracker).toMatchObject({ maxInFlight: 1, inFlight: 1 });
+          followUp.release();
+          await prompt;
+          await session.waitForIdle();
+          expect(events).toEqual(["start", "start", "settled", "settled"]);
+          expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, inFlight: 0, maxInFlight: 1 });
+        } finally {
+          unsubscribe();
+          session.dispose();
+        }
+      });
+    } finally {
+      await roots.cleanup();
+    }
+  });
+
   it("proves tool-result -> settled -> one compaction -> one admitted/settled resume", async () => {
     const roots = await createDisposableHarnessRoots();
     try {
