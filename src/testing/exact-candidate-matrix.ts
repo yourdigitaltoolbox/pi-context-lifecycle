@@ -341,9 +341,11 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
   let resolveTwiceSettled!: () => void;
   let resolveStart!: () => void;
   let resolveEnd!: () => void;
+  let resolveMultiToolResults!: () => void;
   const compactionStarted = new Promise<void>((resolve) => { resolveStart = resolve; });
   const compactionEnded = new Promise<void>((resolve) => { resolveEnd = resolve; });
   const twiceSettled = new Promise<void>((resolve) => { resolveTwiceSettled = resolve; });
+  const multiToolResults = new Promise<void>((resolve) => { resolveMultiToolResults = resolve; });
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "agent_start") {
       agentStartTotal += 1;
@@ -368,6 +370,9 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
     if (event.type === "tool_execution_start") toolExecutionStarts += 1;
     if (event.type === "tool_execution_end") toolExecutionEnds += 1;
     if (event.type === "message_start" && event.message.role === "toolResult") toolResultStarts += 1;
+    if (context.scenarioId === "tool-multi-tool" && toolExecutionStarts >= 2 && toolExecutionEnds >= 2 && toolResultStarts >= 2) {
+      resolveMultiToolResults();
+    }
     if (event.type === "message_start" && event.message.role === "custom" && allProducerCustomTypes.has(event.message.customType)) {
       const submission = Object.freeze({ customType: event.message.customType, sequence: actualProducerSubmissions.length });
       actualProducerSubmissions.push(submission);
@@ -397,6 +402,17 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
     const prompt = session.prompt(`Run exact candidate scenario ${context.scenarioId}.`);
     await waitFor(first.call, "initial tool provider call");
     first.release();
+    // A two-tool assistant response remains an active provider request until
+    // its returned public event stream reaches terminal settlement. Do not
+    // release the next response merely because Pi has entered another tool
+    // transition: that would mask an overlapping stream lifetime.
+    if (context.scenarioId === "tool-multi-tool") {
+      await waitFor(first.completed, "two-tool initial response terminal settlement");
+      await waitFor(multiToolResults, "both multi-tool result settlements");
+      if (toolExecutionStarts !== 2 || toolExecutionEnds !== 2 || toolResultStarts !== 2) {
+        throw new Error(`expected both multi-tool executions/results before post-tool release, got starts=${toolExecutionStarts} ends=${toolExecutionEnds} results=${toolResultStarts}`);
+      }
+    }
     await waitFor(second.call, "post-tool provider call");
     second.release();
     await waitFor(compactionStarted, "compaction_start");
