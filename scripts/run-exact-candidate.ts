@@ -74,3 +74,4 @@ const receipt = await testing.runExactCandidate({
   rollbackRehearsal: args.rollbackRehearsal,
 });
 process.stdout.write(`${JSON.stringify({ status: receipt.status, scenarios: receipt.scenarios.length, completedCycles: receipt.soak.completedCycles, rollback: receipt.rollback?.status ?? "not-requested" })}\n`);
+if (receipt.status === "failed" || receipt.status === "blocked") process.exitCode = 1;

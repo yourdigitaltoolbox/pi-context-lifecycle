@@ -31,6 +31,7 @@ export const EXACT_CANDIDATE_SCENARIOS = [
   "reload-replacement-repair",
   "automatic-threshold-overflow",
   "manual-compact-characterization",
+  "command-handoff",
   "automatic-prehook-race",
   "resume-admission-barrier",
   "large-context-reduction",
@@ -89,7 +90,8 @@ export interface ExactCandidateReceipt {
   rollback?: Readonly<ExactCandidateRollbackReceipt>;
   /** A selected-scenario diagnostic run is never a full candidate verdict. */
   partialScenarioIds?: readonly ExactCandidateScenarioId[];
-  status: "passed" | "partial";
+  /** Blocked/failed receipts are fail-closed evidence, never candidate approval. */
+  status: "passed" | "partial" | "blocked" | "failed";
 }
 
 export interface ExactCandidateRollbackReceipt {
@@ -259,13 +261,14 @@ export async function runExactCandidate(options: {
           seed,
           async execute(context) { await executeScenario(createContext(scenarioId, context)); },
         });
-        if (receipt.status !== "passed") {
-          if (receiptsRoot !== undefined) await writeFile(join(receiptsRoot, "exact-candidate-failure-receipt.json"), `${JSON.stringify({ schemaVersion: 1, manifestSha256, scenarioId, seed, status: "failed", scenario: receipt }, null, 2)}\n`);
-          throw new Error(`exact candidate scenario failed: ${scenarioId}`);
-        }
         scenarios.push(receipt);
       }
-      const soak = partialRun
+      const hasFailedScenario = scenarios.some((scenario) => scenario.status === "failed");
+      const hasBlockedScenario = scenarios.some((scenario) => scenario.status === "blocked");
+      // A matrix with an unsupported public surface or a failed assertion must
+      // still preserve every scenario receipt, but it may never become a soak
+      // or candidate-success claim.
+      const soak = partialRun || hasFailedScenario || hasBlockedScenario
         ? Object.freeze({
           schemaVersion: 1 as const,
           seed,
@@ -288,10 +291,7 @@ export async function runExactCandidate(options: {
             await runSoakCycle(context, cycle);
           },
         });
-      if (soak.status !== "passed" && soak.status !== "skipped") {
-        if (receiptsRoot !== undefined) await writeFile(join(receiptsRoot, "exact-candidate-failure-receipt.json"), `${JSON.stringify({ schemaVersion: 1, manifestSha256, seed, status: soak.status, soak }, null, 2)}\n`);
-        throw new Error(`exact candidate soak did not pass: ${soak.status}`);
-      }
+      const hasFailedSoak = soak.status !== "passed" && soak.status !== "skipped";
       if (options.rollbackRehearsal === true) {
         for (const artifact of [...orderedArtifacts].reverse()) await run(options.piCommand, ["remove", "-l", "--approve", packageDirectories[artifact.id] as string]);
         // A fresh candidate runtime has no project settings before the rehearsal. Pi
@@ -324,9 +324,20 @@ export async function runExactCandidate(options: {
         scenarios: Object.freeze(scenarios),
         soak,
         ...(rollback === undefined ? {} : { rollback }),
-        ...(partialRun ? { partialScenarioIds: Object.freeze([...scenarioIds]), status: "partial" as const } : { status: "passed" as const }),
+        ...(partialRun
+          ? { partialScenarioIds: Object.freeze([...scenarioIds]), status: "partial" as const }
+          : hasFailedScenario || hasFailedSoak
+            ? { status: "failed" as const }
+            : hasBlockedScenario
+              ? { status: "blocked" as const }
+              : { status: "passed" as const }),
       });
-      if (receiptsRoot !== undefined) await writeFile(join(receiptsRoot, "exact-candidate-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
+      if (receiptsRoot !== undefined) {
+        await writeFile(join(receiptsRoot, "exact-candidate-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
+        if (receipt.status === "failed" || receipt.status === "blocked") {
+          await writeFile(join(receiptsRoot, "exact-candidate-failure-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
+        }
+      }
       completedReceipt = receipt;
     });
   } finally {

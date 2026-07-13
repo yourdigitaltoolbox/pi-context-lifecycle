@@ -6,15 +6,23 @@ export interface ScenarioContext {
   timeline: StructuredTimeline;
 }
 
+export class ScenarioBlockedError extends Error {
+  constructor(readonly limitation: string) {
+    super(limitation);
+    this.name = "ScenarioBlockedError";
+  }
+}
+
 export interface ScenarioReceipt {
   schemaVersion: 1;
   scenarioId: string;
   seed: string | number;
-  status: "passed" | "failed";
+  /** Blocked is a fail-closed public-SDK limitation, never a passing verdict. */
+  status: "passed" | "failed" | "blocked";
   startedAt: number;
   completedAt: number;
   eventCount: number;
-  failureCode?: "scenario-failed";
+  failureCode?: "scenario-failed" | "public-sdk-limitation";
   timeline: readonly Readonly<StructuredTimelineEvent>[];
 }
 
@@ -31,15 +39,15 @@ export async function runScenario(options: {
   let failureCode: ScenarioReceipt["failureCode"];
   try {
     await options.execute({ scenarioId: options.scenarioId, seed: options.seed, timeline });
-  } catch {
-    failureCode = "scenario-failed";
+  } catch (error) {
+    failureCode = error instanceof ScenarioBlockedError ? "public-sdk-limitation" : "scenario-failed";
   }
   const events = timeline.events();
   return Object.freeze({
     schemaVersion: 1,
     scenarioId: options.scenarioId,
     seed: options.seed,
-    status: failureCode === undefined ? "passed" : "failed",
+    status: failureCode === undefined ? "passed" : failureCode === "public-sdk-limitation" ? "blocked" : "failed",
     startedAt,
     completedAt: now(),
     eventCount: events.length,

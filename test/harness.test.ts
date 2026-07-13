@@ -1,7 +1,7 @@
 import { access, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createDisposableHarnessRoots, createStructuredTimeline, runBoundedSoak, runPackagedImportSmoke, runScenario, validateCandidateManifest, withDisposableHarnessEnvironment } from "../src/testing/index.js";
+import { ScenarioBlockedError, createDisposableHarnessRoots, createStructuredTimeline, runBoundedSoak, runPackagedImportSmoke, runScenario, validateCandidateManifest, withDisposableHarnessEnvironment } from "../src/testing/index.js";
 
 describe("candidate manifest", () => {
   it("accepts only immutable relative artifact identities and a complete deterministic order", () => {
@@ -66,6 +66,16 @@ describe("scenario and soak drivers", () => {
     });
     expect(failed).toMatchObject({ status: "failed", failureCode: "scenario-failed", eventCount: 0 });
     expect(JSON.stringify(failed)).not.toContain("secret provider body");
+
+    const blocked = await runScenario({
+      scenarioId: "public-sdk-gap",
+      seed: 9,
+      execute({ timeline }) {
+        timeline.record({ type: "public-sdk-limitation", outcome: "documented-test-control-unavailable" });
+        throw new ScenarioBlockedError("documented-test-control-unavailable");
+      },
+    });
+    expect(blocked).toMatchObject({ status: "blocked", failureCode: "public-sdk-limitation", eventCount: 1 });
 
     const cycles: number[] = [];
     const soak = await runBoundedSoak({

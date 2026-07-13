@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { EXACT_CANDIDATE_SCENARIOS, runExactCandidate, type ExactCandidateCommandRunner } from "../src/testing/index.js";
+import { EXACT_CANDIDATE_SCENARIOS, ScenarioBlockedError, runExactCandidate, type ExactCandidateCommandRunner } from "../src/testing/index.js";
 
 const packages = [
   ["lifecycle", "@yourdigitaltoolbox/pi-context-lifecycle"],
@@ -87,7 +87,7 @@ describe("exact candidate runner", () => {
         ["pi", "install", "-l"],
         ["pi", "install", "-l"],
       ]);
-      expect(receipt.scenarios).toHaveLength(16);
+      expect(receipt.scenarios).toHaveLength(EXACT_CANDIDATE_SCENARIOS.length);
       expect(receipt.scenarios.find((entry) => entry.scenarioId === "manual-compact-characterization")?.status).toBe("passed");
       expect(JSON.parse(await readFile(join(root, "receipts", "exact-candidate-receipt.json"), "utf8"))).toMatchObject({ status: "passed", soak: { completedCycles: 3 } });
     } finally {
@@ -110,6 +110,28 @@ describe("exact candidate runner", () => {
       });
       expect(seenScenarios).toEqual(["tool-multi-tool"]);
       expect(receipt).toMatchObject({ status: "partial", partialScenarioIds: ["tool-multi-tool"], soak: { status: "skipped", completedCycles: 0 } });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records every public-SDK limitation as blocked evidence and never starts the soak", async () => {
+    const root = await candidateRoot();
+    try {
+      const receipt = await runExactCandidate({
+        candidateRoot: root,
+        manifestPath: join(root, "candidate-manifest.json"),
+        piCommand: "pi",
+        runner: archiveInstaller(),
+        executeScenario(context) {
+          context.timeline.record({ type: "public-sdk-limitation", outcome: "documented-command-dispatch-unavailable" });
+          throw new ScenarioBlockedError("documented-command-dispatch-unavailable");
+        },
+        runSoakCycle: () => { throw new Error("blocked matrix must not soak"); },
+      });
+      expect(receipt).toMatchObject({ status: "blocked", soak: { status: "skipped", completedCycles: 0 } });
+      expect(receipt.scenarios).toHaveLength(EXACT_CANDIDATE_SCENARIOS.length);
+      expect(receipt.scenarios.every((scenario) => scenario.status === "blocked" && scenario.failureCode === "public-sdk-limitation")).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -139,10 +161,10 @@ describe("exact candidate runner", () => {
     }
   });
 
-  it("writes a redacted external failure receipt instead of reporting a partial scenario matrix", async () => {
+  it("writes all redacted failed scenario receipts and skips the soak instead of reporting candidate success", async () => {
     const root = await candidateRoot();
     try {
-      await expect(runExactCandidate({
+      const receipt = await runExactCandidate({
         candidateRoot: root,
         manifestPath: join(root, "candidate-manifest.json"),
         piCommand: "pi",
@@ -150,9 +172,11 @@ describe("exact candidate runner", () => {
         runner: archiveInstaller(),
         executeScenario() { throw new Error("prompt or provider body must not leak"); },
         runSoakCycle: () => undefined,
-      })).rejects.toThrow(/scenario failed/i);
-      const failure = JSON.parse(await readFile(join(root, "receipts", "exact-candidate-failure-receipt.json"), "utf8")) as { status: string; scenario: { timeline: unknown[] } };
-      expect(failure).toMatchObject({ status: "failed", scenario: { timeline: [] } });
+      });
+      const failure = JSON.parse(await readFile(join(root, "receipts", "exact-candidate-failure-receipt.json"), "utf8")) as { status: string; scenarios: Array<{ timeline: unknown[] }> };
+      expect(receipt).toMatchObject({ status: "failed", soak: { status: "skipped", completedCycles: 0 } });
+      expect(failure).toMatchObject({ status: "failed" });
+      expect(failure.scenarios).toHaveLength(EXACT_CANDIDATE_SCENARIOS.length);
       expect(JSON.stringify(failure)).not.toContain("prompt or provider body");
     } finally {
       await rm(root, { recursive: true, force: true });
