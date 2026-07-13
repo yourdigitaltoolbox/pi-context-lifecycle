@@ -47,8 +47,17 @@ function isCancellationError(error: Error): boolean {
 export interface ManagedCompactionAdapter {
   compact(options: { customInstructions: string; onComplete(): void; onError(error: Error): void }): void;
   sendResume(message: string): void;
+  /** Public Pi context guards; never settlement authority by themselves. */
+  isIdle?(): boolean;
+  hasPendingMessages?(): boolean;
   appendLifecycleEntry?(claim: LifecycleClaim): void;
   verifyRepairEvidence?(request: RepairRequest): boolean;
+}
+
+interface SettlementProof {
+  generationId: string;
+  source: "session-start" | "agent-settled";
+  epoch: number;
 }
 
 interface ActiveOperation {
@@ -121,6 +130,8 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private lastOutcome: OperationOutcome | undefined;
   private blockedReason: string | undefined;
   private adapter: ManagedCompactionAdapter | undefined;
+  private settlementProof: SettlementProof | undefined;
+  private settlementEpoch = 0;
   private disposed = false;
   private diagnosticSequence = 0;
   private readonly records: DiagnosticRecord[] = [];
@@ -153,6 +164,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.adapter = adapter;
     this.phase = "idle";
     this.transition("session-bound");
+    this.observeSettlement("session-start");
     return this.generationId;
   }
 
@@ -206,6 +218,13 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (this.disposed || !this.sessionId || !this.generationId || !this.phase) return { disposition: "rejected", code: "session-unavailable" };
     if (request.sessionId !== this.sessionId) return { disposition: "rejected", code: "session-mismatch", generationId: this.generationId };
     if (request.generationId !== this.generationId) return { disposition: "rejected", code: "generation-mismatch", generationId: this.generationId };
+    const suppliedSettlementPolicy: unknown = request.settlementPolicy;
+    if (suppliedSettlementPolicy !== undefined && suppliedSettlementPolicy !== "next-agent-settled" && suppliedSettlementPolicy !== "current-or-next-settled-boundary") return { disposition: "rejected", code: "invalid-start-authority", generationId: this.generationId };
+    const settlementPolicy = suppliedSettlementPolicy ?? "next-agent-settled";
+    const requestsCurrentBoundary = settlementPolicy === "current-or-next-settled-boundary";
+    if (requestsCurrentBoundary && (request.reason !== "remote" || request.actor !== "operator" || request.channel !== "remote" || request.source !== "remote-pi-action")) {
+      return { disposition: "rejected", code: "invalid-start-authority", generationId: this.generationId };
+    }
     if (this.operation !== undefined) {
       if (!this.operation.managed) return { disposition: "rejected", code: "automatic-compaction-active", generationId: this.generationId };
       if (this.phase !== "pending-settle" && this.phase !== "compacting" && this.phase !== "resuming") return { disposition: "rejected", code: "operation-not-joinable", generationId: this.generationId };
@@ -223,6 +242,25 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       return { disposition: "joined", operationId: this.operation.id, generationId: this.generationId };
     }
     if (this.phase !== "idle") return { disposition: "rejected", code: "not-idle", generationId: this.generationId };
+    let startAtCurrentBoundary = false;
+    if (requestsCurrentBoundary) {
+      let isIdle: boolean;
+      let hasPendingMessages: boolean;
+      try {
+        isIdle = this.adapter?.isIdle?.() === true;
+        hasPendingMessages = this.adapter?.hasPendingMessages?.() === true;
+      } catch {
+        this.record("settlement-proof-unavailable");
+        return { disposition: "rejected", code: "settlement-proof-unavailable", generationId: this.generationId };
+      }
+      if (isIdle && !hasPendingMessages) {
+        if (!this.hasCurrentSettlementProof()) {
+          this.record("settlement-proof-unavailable");
+          return { disposition: "rejected", code: "settlement-proof-unavailable", generationId: this.generationId };
+        }
+        startAtCurrentBoundary = true;
+      }
+    }
     const operationId = randomUUID();
     this.operation = {
       id: operationId,
@@ -245,11 +283,17 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       return { disposition: "rejected", code: "claim-persist-failed", generationId: this.generationId };
     }
     this.transition("request-accepted");
+    if (startAtCurrentBoundary) {
+      this.record("remote-idle-started");
+      this.startCompaction();
+    }
     return { disposition: "accepted", operationId: this.operation.id, generationId: this.generationId };
   }
 
   onAgentSettled(generationId: string): void {
-    if (!this.isCurrentGeneration(generationId) || !this.operation) return;
+    if (!this.isCurrentGeneration(generationId)) return;
+    this.observeSettlement("agent-settled");
+    if (!this.operation) return;
     if (this.phase === "pending-settle") {
       this.startCompaction();
       return;
@@ -273,8 +317,19 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     }
   }
 
+  /**
+   * Activity invalidates remembered settlement before Pi can expose a new run.
+   * It is intentionally conservative: only a later genuine settled boundary
+   * may restore immediate-Remote eligibility.
+   */
+  onActivity(generationId: string): void {
+    if (!this.isCurrentGeneration(generationId)) return;
+    this.invalidateSettlementProof();
+  }
+
   onSessionBeforeCompact(generationId: string, reason: "manual" | "threshold" | "overflow"): string | undefined {
     if (!this.isCurrentGeneration(generationId)) return undefined;
+    this.invalidateSettlementProof();
     if (reason === "manual" && this.phase === "compacting" && this.operation?.managed) {
       this.record("managed-compaction-preflight-observed");
       return this.operation.id;
@@ -454,7 +509,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     const identity = { phase: this.phase, generationId: this.generationId, ...(this.operation === undefined ? {} : { operationId: this.operation.id }) };
     if (request.sessionId !== this.sessionId) return { disposition: "reject", code: "session-mismatch", ...identity };
     if (request.generationId !== this.generationId) return { disposition: "reject", code: "generation-mismatch", ...identity };
-    if (this.phase === "idle") return { disposition: "deliver", code: "idle", ...identity };
+    if (this.phase === "idle") {
+      this.invalidateSettlementProof();
+      return { disposition: "deliver", code: "idle", ...identity };
+    }
     if (this.phase === "releasing" && permit !== undefined && this.activePermits.has(permit) && permit.consumerId === request.consumerId && permit.laneId === request.laneId && permit.sessionId === this.sessionId && permit.generationId === this.generationId && permit.operationId === this.operation?.id) {
       return { disposition: "deliver", code: "release-permit", ...identity };
     }
@@ -601,10 +659,27 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.blockedDrainerConsumerId = undefined;
     this.blockedDrainerLaneId = undefined;
     this.phase = undefined;
+    this.settlementProof = undefined;
     this.adapter = undefined;
     const result = this.publication?.dispose() ?? false;
     this.publication = undefined;
     return result;
+  }
+
+  private observeSettlement(source: SettlementProof["source"]): void {
+    if (!this.generationId) return;
+    this.settlementProof = { generationId: this.generationId, source, epoch: ++this.settlementEpoch };
+    this.record("settlement-observed");
+  }
+
+  private hasCurrentSettlementProof(): boolean {
+    return this.settlementProof?.generationId === this.generationId;
+  }
+
+  private invalidateSettlementProof(): void {
+    if (!this.hasCurrentSettlementProof()) return;
+    this.settlementProof = undefined;
+    this.record("settlement-invalidated");
   }
 
   private startCompaction(): void {

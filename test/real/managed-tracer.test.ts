@@ -13,7 +13,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import contextLifecycleExtension from "../../src/extension.js";
 import { createDeferredFakeProvider, createDisposableHarnessRoots, withDisposableHarnessEnvironment } from "../../src/testing/index.js";
-import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1 } from "../../src/registry.js";
+import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, requestCompaction } from "../../src/registry.js";
 import { CONTEXT_LIFECYCLE_REGISTRY_SYMBOL } from "../../src/types.js";
 
 interface TimelineEvent { index: number; type: string; role?: string; entryType?: string }
@@ -108,6 +108,175 @@ describe("public SDK managed tracer", () => {
           await session.waitForIdle();
           expect(events).toEqual(["start", "start", "settled", "settled"]);
           expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, inFlight: 0, maxInFlight: 1 });
+        } finally {
+          unsubscribe();
+          session.dispose();
+        }
+      });
+    } finally {
+      await roots.cleanup();
+    }
+  });
+
+  it("starts an attested Remote compact from an already settled public session without fabricating agent_settled", async () => {
+    const roots = await createDisposableHarnessRoots();
+    try {
+      await withDisposableHarnessEnvironment(roots, async () => {
+        const provider = createDeferredFakeProvider();
+        const historySummary = provider.enqueue(fauxAssistantMessage("Idle Remote history summary."));
+        const turnSummary = provider.enqueue(fauxAssistantMessage("Idle Remote turn summary."));
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_000 } });
+        const providerExtension = (pi: ExtensionAPI) => {
+          pi.registerProvider(provider.provider, {
+            api: provider.api,
+            apiKey: "disposable-test-key",
+            baseUrl: "http://localhost.invalid",
+            models: provider.models.map((model) => ({ id: model.id, name: model.name, api: model.api, reasoning: model.reasoning, input: model.input, cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens })),
+            streamSimple: (model, context, options) => provider.streamSimple(model, context, options),
+          });
+        };
+        const loader = new DefaultResourceLoader({ cwd: roots.cwd, agentDir: roots.agentDir, settingsManager, extensionFactories: [providerExtension, contextLifecycleExtension] });
+        await loader.reload();
+        const sessionManager = SessionManager.create(roots.cwd, roots.sessions);
+        for (let index = 0; index < 5; index += 1) {
+          sessionManager.appendMessage({ role: "user", content: `idle-remote-history-${index} ${"u".repeat(4_000)}`, timestamp: Date.now() });
+          sessionManager.appendMessage(fauxAssistantMessage(`idle-remote-response-${index} ${"a".repeat(4_000)}`));
+        }
+        const { session } = await createAgentSession({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          sessionManager,
+          model: provider.getModel(),
+          tools: [],
+        });
+        await session.bindExtensions({ mode: "print" });
+        const events: string[] = [];
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "agent_settled" || event.type === "compaction_start" || event.type === "compaction_end") events.push(event.type);
+        });
+        try {
+          const snapshot = getContextLifecycleSnapshotV1();
+          const disposition = requestCompaction({
+            requestId: "idle-remote-request",
+            sessionId: snapshot.sessionId ?? "",
+            generationId: snapshot.generationId ?? "",
+            reason: "remote",
+            source: "remote-pi-action",
+            actor: "operator",
+            channel: "remote",
+            settlementPolicy: "current-or-next-settled-boundary",
+          });
+          expect(disposition).toMatchObject({ disposition: "accepted" });
+          await vi.waitFor(() => expect(events).toEqual(["compaction_start"]), { timeout: 5_000 });
+          await historySummary.call;
+          historySummary.release();
+          await turnSummary.call;
+          turnSummary.release();
+          await vi.waitFor(() => expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" }), { timeout: 5_000 });
+          expect(events).toEqual(["compaction_start", "compaction_end"]);
+          expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, maxInFlight: 1 });
+        } finally {
+          unsubscribe();
+          session.dispose();
+        }
+      });
+    } finally {
+      await roots.cleanup();
+    }
+  });
+
+  it("rejects input-preflight Remote authority and delays an active Remote request until genuine settlement", async () => {
+    const roots = await createDisposableHarnessRoots();
+    try {
+      await withDisposableHarnessEnvironment(roots, async () => {
+        const provider = createDeferredFakeProvider();
+        const initial = provider.enqueue(fauxAssistantMessage("Active turn complete."));
+        const historySummary = provider.enqueue(fauxAssistantMessage("Active Remote history summary."));
+        const turnSummary = provider.enqueue(fauxAssistantMessage("Active Remote turn summary."));
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_000 } });
+        let preflightDisposition: ReturnType<typeof requestCompaction> | undefined;
+        const preflightExtension = (pi: ExtensionAPI) => {
+          pi.on("input", () => {
+            const snapshot = getContextLifecycleSnapshotV1();
+            preflightDisposition = requestCompaction({
+              requestId: "input-preflight-remote",
+              sessionId: snapshot.sessionId ?? "",
+              generationId: snapshot.generationId ?? "",
+              reason: "remote",
+              source: "remote-pi-action",
+              actor: "operator",
+              channel: "remote",
+              settlementPolicy: "current-or-next-settled-boundary",
+            });
+          });
+          pi.registerProvider(provider.provider, {
+            api: provider.api,
+            apiKey: "disposable-test-key",
+            baseUrl: "http://localhost.invalid",
+            models: provider.models.map((model) => ({ id: model.id, name: model.name, api: model.api, reasoning: model.reasoning, input: model.input, cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens })),
+            streamSimple: (model, context, options) => provider.streamSimple(model, context, options),
+          });
+        };
+        const loader = new DefaultResourceLoader({ cwd: roots.cwd, agentDir: roots.agentDir, settingsManager, extensionFactories: [contextLifecycleExtension, preflightExtension] });
+        await loader.reload();
+        const sessionManager = SessionManager.create(roots.cwd, roots.sessions);
+        for (let index = 0; index < 5; index += 1) {
+          sessionManager.appendMessage({ role: "user", content: `active-remote-history-${index} ${"u".repeat(4_000)}`, timestamp: Date.now() });
+          sessionManager.appendMessage(fauxAssistantMessage(`active-remote-response-${index} ${"a".repeat(4_000)}`));
+        }
+        const { session } = await createAgentSession({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          sessionManager,
+          model: provider.getModel(),
+          tools: [],
+        });
+        await session.bindExtensions({ mode: "print" });
+        const events: string[] = [];
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "agent_start" || event.type === "agent_settled" || event.type === "compaction_start") events.push(event.type);
+        });
+        try {
+          const prompt = session.prompt("Start a held active turn.");
+          await initial.call;
+          expect(preflightDisposition).toMatchObject({ disposition: "rejected", code: "settlement-proof-unavailable" });
+          const snapshot = getContextLifecycleSnapshotV1();
+          expect(requestCompaction({
+            requestId: "active-remote-request",
+            sessionId: snapshot.sessionId ?? "",
+            generationId: snapshot.generationId ?? "",
+            reason: "remote",
+            source: "remote-pi-action",
+            actor: "operator",
+            channel: "remote",
+            settlementPolicy: "current-or-next-settled-boundary",
+          })).toMatchObject({ disposition: "accepted" });
+          expect(getContextLifecycleSnapshotV1().phase).toBe("pending-settle");
+          expect(events).toEqual(["agent_start"]);
+          initial.release();
+          await initial.completed;
+          await historySummary.call;
+          expect(events).toContain("agent_settled");
+          expect(events).toContain("compaction_start");
+          expect(events.indexOf("compaction_start")).toBeGreaterThan(events.indexOf("agent_start"));
+          historySummary.release();
+          await turnSummary.call;
+          turnSummary.release();
+          await prompt;
+          await vi.waitFor(() => expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" }), { timeout: 5_000 });
+          expect(provider.tracker).toMatchObject({ entered: 3, completed: 3, maxInFlight: 1 });
         } finally {
           unsubscribe();
           session.dispose();

@@ -164,6 +164,12 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
       sendResume(message) {
         pi.sendUserMessage(message, { deliverAs: "steer" });
       },
+      isIdle() {
+        return binding.context.isIdle();
+      },
+      hasPendingMessages() {
+        return binding.context.hasPendingMessages();
+      },
       appendLifecycleEntry(claim) {
         pi.appendEntry("pi-context-lifecycle", claim);
       },
@@ -175,6 +181,37 @@ export default function contextLifecycleExtension(pi: ExtensionAPI): void {
     next.restoreClaims(lifecycleClaims(ctx));
     coordinator = next;
     activeBinding = binding;
+  });
+
+  const invalidateSettlementForActivity = (ctx: ExtensionContext): void => {
+    const binding = bindingFor(ctx);
+    if (binding === undefined) return;
+    binding.context = ctx;
+    coordinator?.onActivity(binding.generationId);
+  };
+
+  pi.on("input", (_event, ctx) => {
+    invalidateSettlementForActivity(ctx);
+  });
+
+  pi.on("before_agent_start", (_event, ctx) => {
+    invalidateSettlementForActivity(ctx);
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    invalidateSettlementForActivity(ctx);
+  });
+
+  pi.on("session_before_switch", (_event, ctx) => {
+    invalidateSettlementForActivity(ctx);
+  });
+
+  pi.on("session_before_fork", (_event, ctx) => {
+    invalidateSettlementForActivity(ctx);
+  });
+
+  pi.on("session_before_tree", (_event, ctx) => {
+    invalidateSettlementForActivity(ctx);
   });
 
   pi.on("agent_settled", (_event, ctx) => {

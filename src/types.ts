@@ -67,6 +67,8 @@ export interface LifecycleEvent extends Snapshot {
   event: "snapshot";
 }
 
+export type CompactSettlementPolicy = "next-agent-settled" | "current-or-next-settled-boundary";
+
 export interface CompactRequest {
   requestId: string;
   sessionId: string;
@@ -74,6 +76,13 @@ export interface CompactRequest {
   reason: "self" | "remote";
   resume?: boolean;
   source?: string;
+  /**
+   * Defaults to the next genuine agent_settled boundary. The immediate policy
+   * is accepted only from the fixed authenticated Remote adapter attestation.
+   */
+  settlementPolicy?: CompactSettlementPolicy;
+  actor?: "operator";
+  channel?: "remote";
 }
 
 export type CompactDisposition =

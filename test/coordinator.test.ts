@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "../src/coordinator.js";
 import { registryForHost } from "../src/registry.js";
@@ -12,10 +13,12 @@ function setup() {
   const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
   const sendResume = vi.fn<ManagedCompactionAdapter["sendResume"]>();
   const appendLifecycleEntry = vi.fn<(claim: LifecycleClaim) => void>();
+  const isIdle = vi.fn(() => true);
+  const hasPendingMessages = vi.fn(() => false);
   const publication = registry.publish(coordinator.ownerInstanceId, coordinator, {});
   coordinator.attachPublication(publication);
-  const generationId = coordinator.bindSession("session", { compact, sendResume, appendLifecycleEntry });
-  return { registry, coordinator, compact, sendResume, appendLifecycleEntry, generationId };
+  const generationId = coordinator.bindSession("session", { compact, sendResume, isIdle, hasPendingMessages, appendLifecycleEntry });
+  return { registry, coordinator, compact, sendResume, appendLifecycleEntry, isIdle, hasPendingMessages, generationId };
 }
 
 function completeManagedCompaction(test: ReturnType<typeof setup>): void {
@@ -68,9 +71,151 @@ describe("managed lifecycle coordinator", () => {
     expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" });
   });
 
+  it("starts an attested Remote request synchronously from the current session-start settlement proof", () => {
+    const test = setup();
+    const disposition = test.coordinator.requestCompaction({
+      requestId: "remote-idle",
+      sessionId: "session",
+      generationId: test.generationId,
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+
+    expect(disposition).toMatchObject({ disposition: "accepted" });
+    expect(test.appendLifecycleEntry.mock.calls.map(([claim]) => claim.state)).toEqual(["requested", "compacting"]);
+    expect(test.compact).toHaveBeenCalledTimes(1);
+    expect(test.registry.snapshot().phase).toBe("compacting");
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "remote-idle-started" }));
+  });
+
+  it("remembers a no-operation settled boundary but rejects a missing proof despite public idle", () => {
+    const test = setup();
+    test.coordinator.onActivity(test.generationId);
+    const rejected = test.coordinator.requestCompaction({
+      requestId: "no-proof",
+      sessionId: "session",
+      generationId: test.generationId,
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+    expect(rejected).toMatchObject({ disposition: "rejected", code: "settlement-proof-unavailable" });
+    expect(test.compact).not.toHaveBeenCalled();
+
+    test.coordinator.onAgentSettled(test.generationId);
+    const accepted = test.coordinator.requestCompaction({
+      requestId: "remembered-proof",
+      sessionId: "session",
+      generationId: test.generationId,
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+    expect(accepted).toMatchObject({ disposition: "accepted" });
+    expect(test.compact).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for a genuine settled boundary when public work is active or queued", () => {
+    const test = setup();
+    test.isIdle.mockReturnValue(false);
+    const active = test.coordinator.requestCompaction({
+      requestId: "remote-active",
+      sessionId: "session",
+      generationId: test.generationId,
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+    expect(active).toMatchObject({ disposition: "accepted" });
+    expect(test.registry.snapshot().phase).toBe("pending-settle");
+    expect(test.compact).not.toHaveBeenCalled();
+    test.isIdle.mockReturnValue(true);
+    test.coordinator.onAgentSettled(test.generationId);
+    expect(test.compact).toHaveBeenCalledTimes(1);
+
+    const queued = setup();
+    queued.hasPendingMessages.mockReturnValue(true);
+    queued.coordinator.requestCompaction({
+      requestId: "remote-queued",
+      sessionId: "session",
+      generationId: queued.generationId,
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+    expect(queued.compact).not.toHaveBeenCalled();
+    queued.hasPendingMessages.mockReturnValue(false);
+    queued.coordinator.onAgentSettled(queued.generationId);
+    expect(queued.compact).toHaveBeenCalledTimes(1);
+  });
+
+  it("invalidates proof for a delivered managed wake and never lets a join force-start a tool operation", () => {
+    const test = setup();
+    expect(test.coordinator.admitWake({ consumerId: "consumer", laneId: TEST_LANE, wakeId: "wake", sessionId: "session", generationId: test.generationId })).toMatchObject({ disposition: "deliver" });
+    const rejected = test.coordinator.requestCompaction({
+      requestId: "after-wake",
+      sessionId: "session",
+      generationId: test.generationId,
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+    expect(rejected).toMatchObject({ disposition: "rejected", code: "settlement-proof-unavailable" });
+
+    const joined = setup();
+    const tool = joined.coordinator.requestSelfCompaction("", "tool");
+    const remote = joined.coordinator.requestCompaction({
+      requestId: "join-tool",
+      sessionId: "session",
+      generationId: joined.generationId,
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+    expect(tool).toMatchObject({ disposition: "accepted" });
+    expect(remote).toMatchObject({ disposition: "joined" });
+    expect(joined.compact).not.toHaveBeenCalled();
+  });
+
+  it("rejects untrusted current-boundary assertions and preserves default tool/legacy waiting semantics", () => {
+    const test = setup();
+    for (const request of [
+      { reason: "self", source: "remote-pi-action", actor: "operator", channel: "remote" },
+      { reason: "remote", source: "other", actor: "operator", channel: "remote" },
+      { reason: "remote", source: "remote-pi-action", actor: "operator" },
+      { reason: "remote", source: "remote-pi-action", channel: "remote" },
+    ]) {
+      expect(test.coordinator.requestCompaction({
+        requestId: randomUUID(),
+        sessionId: "session",
+        generationId: test.generationId,
+        settlementPolicy: "current-or-next-settled-boundary",
+        ...request,
+      } as CompactRequest)).toMatchObject({ disposition: "rejected", code: "invalid-start-authority" });
+    }
+    expect(test.coordinator.requestSelfCompaction("", "tool")).toMatchObject({ disposition: "accepted" });
+    expect(test.compact).not.toHaveBeenCalled();
+  });
+
   it("best-effort adopts native manual compaction only after its visible preflight hook", async () => {
     const test = setup();
     test.coordinator.onSessionBeforeCompact(test.generationId, "manual");
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "settlement-invalidated" }));
     expect(test.registry.snapshot()).toMatchObject({ phase: "observed-preflight", reason: "builtin" });
     expect(test.coordinator.admitWake({ consumerId: "consumer", laneId: TEST_LANE, wakeId: "wake", sessionId: "session", generationId: test.generationId }).disposition).toBe("hold");
 

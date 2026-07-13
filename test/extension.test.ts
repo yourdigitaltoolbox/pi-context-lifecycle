@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ManagedCompactionAdapter } from "../src/coordinator.js";
 import contextLifecycleExtension from "../src/extension.js";
-import { getContextLifecycleSnapshotV1 } from "../src/registry.js";
+import { getContextLifecycleSnapshotV1, requestCompaction } from "../src/registry.js";
 import { CONTEXT_LIFECYCLE_REGISTRY_SYMBOL } from "../src/types.js";
 
 interface RegisteredToolLike {
@@ -30,9 +30,13 @@ function harness() {
   const compact = vi.fn<ManagedCompactionAdapter["compact"]>();
   let contextUsage: { tokens: number; contextWindow: number; percent: number } | undefined;
   let sessionEntries: unknown[] = [];
+  let idle = true;
+  let pendingMessages = false;
   const context = {
     sessionManager: { getSessionId: () => "session", getEntries: () => sessionEntries },
     compact,
+    isIdle: () => idle,
+    hasPendingMessages: () => pendingMessages,
     getContextUsage: () => contextUsage,
   } as unknown as ExtensionContext;
   const emit = (name: string, event: Record<string, unknown> = {}, eventContext: ExtensionContext = context) => handlers.get(name)?.(event, eventContext);
@@ -44,6 +48,8 @@ function harness() {
     sendUserMessage,
     appendEntry,
     setContextUsage(tokens: number, contextWindow: number) { contextUsage = { tokens, contextWindow, percent: tokens / contextWindow }; },
+    setIdle(value: boolean) { idle = value; },
+    setPendingMessages(value: boolean) { pendingMessages = value; },
     setSessionEntries(entries: unknown[]) { sessionEntries = entries; },
     getTool: (name = "self_compact") => tools.get(name),
     getCommand: (name: string) => commands.get(name),
@@ -92,6 +98,56 @@ describe("Pi extension tracer", () => {
     test.emit("agent_settled", { type: "agent_settled" });
     expect(getContextLifecycleSnapshotV1().phase).toBe("idle");
     expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts only an internally attested Remote request from session-start proof and invalidates at public activity seams", () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+    const snapshot = getContextLifecycleSnapshotV1();
+    const request = () => requestCompaction({
+      requestId: "remote-idle",
+      sessionId: snapshot.sessionId ?? "",
+      generationId: snapshot.generationId ?? "",
+      reason: "remote",
+      source: "remote-pi-action",
+      actor: "operator",
+      channel: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    });
+
+    expect(request()).toMatchObject({ disposition: "accepted" });
+    expect(test.compact).toHaveBeenCalledTimes(1);
+    expect(test.appendEntry.mock.calls.map(([, claim]) => (claim as { state: string }).state)).toEqual(["requested", "compacting"]);
+    test.emit("session_shutdown", { type: "session_shutdown", reason: "reload" });
+
+    const blocked = harness();
+    contextLifecycleExtension(blocked.api);
+    blocked.emit("session_start", { type: "session_start", reason: "startup" });
+    const invalidatingEvents = ["input", "before_agent_start", "agent_start", "session_before_switch", "session_before_fork", "session_before_tree"];
+    for (const event of invalidatingEvents) {
+      blocked.emit(event, { type: event });
+      const current = getContextLifecycleSnapshotV1();
+      expect(requestCompaction({
+        requestId: `remote-${event}`,
+        sessionId: current.sessionId ?? "",
+        generationId: current.generationId ?? "",
+        reason: "remote",
+        source: "remote-pi-action",
+        actor: "operator",
+        channel: "remote",
+        settlementPolicy: "current-or-next-settled-boundary",
+      })).toMatchObject({ disposition: "rejected", code: "settlement-proof-unavailable" });
+      blocked.emit("agent_settled", { type: "agent_settled" });
+    }
+    const current = getContextLifecycleSnapshotV1();
+    expect(requestCompaction({
+      requestId: "wrong-attestation",
+      sessionId: current.sessionId ?? "",
+      generationId: current.generationId ?? "",
+      reason: "remote",
+      settlementPolicy: "current-or-next-settled-boundary",
+    })).toMatchObject({ disposition: "rejected", code: "invalid-start-authority" });
   });
 
   it("arms, emits once, and rearms the high-context handoff watcher", () => {

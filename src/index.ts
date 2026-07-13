@@ -13,6 +13,7 @@ export {
   CONTEXT_LIFECYCLE_RELEASE_LANES,
   type CompactDisposition,
   type CompactRequest,
+  type CompactSettlementPolicy,
   type ContextLifecycleV1,
   type DiagnosticRecord,
   type DrainAck,
