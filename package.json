@@ -42,6 +42,7 @@
     "test:real-session": "vitest run --config vitest.real.config.ts",
     "test:packaged-smoke": "npm run build && node scripts/run-packaged-smoke.ts",
     "test:candidate": "npm run build && npm run test:real-session && node scripts/run-packaged-smoke.ts",
+    "test:exact-candidate": "npm run build && node scripts/run-exact-candidate.ts",
     "lint": "eslint .",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build",
     "ci": "npm run check && npm run test:real-session && node scripts/run-packaged-smoke.ts && npm pack --dry-run"

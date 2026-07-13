@@ -69,6 +69,7 @@ export interface ExactCandidateScenarioContext extends ScenarioContext {
   candidateRoot: string;
   runtimeRoot: string;
   packageDirectories: Readonly<Record<string, string>>;
+  packageDirectoriesByName: Readonly<Record<string, string>>;
   roots: DisposableHarnessRoots;
   manualCharacterization: boolean;
 }
@@ -172,10 +173,17 @@ export async function runExactCandidate(options: {
   rollbackRehearsal?: boolean;
   writeReceipts?: string;
   runner?: ExactCandidateCommandRunner;
-  executeScenario(context: ExactCandidateScenarioContext): Promise<void> | void;
-  runSoakCycle(context: ExactCandidateScenarioContext, cycle: number): Promise<void> | void;
+  executeScenario?(context: ExactCandidateScenarioContext): Promise<void> | void;
+  runSoakCycle?(context: ExactCandidateScenarioContext, cycle: number): Promise<void> | void;
 }): Promise<Readonly<ExactCandidateReceipt>> {
   const candidateRoot = resolve(options.candidateRoot);
+  const matrix = await import("./exact-candidate-matrix.js");
+  const executeScenario = options.executeScenario === undefined
+    ? (context: ExactCandidateScenarioContext) => matrix.executeExactCandidateScenario(context)
+    : (context: ExactCandidateScenarioContext) => options.executeScenario?.(context);
+  const runSoakCycle = options.runSoakCycle === undefined
+    ? (context: ExactCandidateScenarioContext, cycle: number) => matrix.runExactCandidateSoakCycle(context, cycle)
+    : (context: ExactCandidateScenarioContext, cycle: number) => options.runSoakCycle?.(context, cycle);
   const { manifest, manifestSha256 } = await readManifest(candidateRoot, options.manifestPath);
   const seed = options.seed ?? manifest.scenario.seed;
   const cycles = options.cycles ?? 100;
@@ -225,11 +233,13 @@ export async function runExactCandidate(options: {
         await run(options.piCommand, ["install", "-l", "--approve", actualDirectory]);
       }
       const frozenPackageDirectories = Object.freeze({ ...packageDirectories });
+      const frozenPackageDirectoriesByName = Object.freeze(Object.fromEntries(orderedArtifacts.map((artifact) => [artifact.packageName, packageDirectories[artifact.id] as string])));
       const createContext = (scenarioId: string, context: ScenarioContext): ExactCandidateScenarioContext => ({
         ...context,
         candidateRoot,
         runtimeRoot,
         packageDirectories: frozenPackageDirectories,
+        packageDirectoriesByName: frozenPackageDirectoriesByName,
         roots,
         manualCharacterization: scenarioId === "manual-compact-characterization",
       });
@@ -238,9 +248,12 @@ export async function runExactCandidate(options: {
         const receipt = await runScenario({
           scenarioId,
           seed,
-          async execute(context) { await options.executeScenario(createContext(scenarioId, context)); },
+          async execute(context) { await executeScenario(createContext(scenarioId, context)); },
         });
-        if (receipt.status !== "passed") throw new Error(`exact candidate scenario failed: ${scenarioId}`);
+        if (receipt.status !== "passed") {
+          if (receiptsRoot !== undefined) await writeFile(join(receiptsRoot, "exact-candidate-failure-receipt.json"), `${JSON.stringify({ schemaVersion: 1, manifestSha256, scenarioId, seed, status: "failed", scenario: receipt }, null, 2)}\n`);
+          throw new Error(`exact candidate scenario failed: ${scenarioId}`);
+        }
         scenarios.push(receipt);
       }
       const soak = await runBoundedSoak({
@@ -253,10 +266,13 @@ export async function runExactCandidate(options: {
             seed,
             timeline: createStructuredTimeline({ scenarioId: "soak", seed }),
           });
-          await options.runSoakCycle(context, cycle);
+          await runSoakCycle(context, cycle);
         },
       });
-      if (soak.status !== "passed") throw new Error(`exact candidate soak did not pass: ${soak.status}`);
+      if (soak.status !== "passed") {
+        if (receiptsRoot !== undefined) await writeFile(join(receiptsRoot, "exact-candidate-failure-receipt.json"), `${JSON.stringify({ schemaVersion: 1, manifestSha256, seed, status: soak.status, soak }, null, 2)}\n`);
+        throw new Error(`exact candidate soak did not pass: ${soak.status}`);
+      }
       if (options.rollbackRehearsal === true) {
         for (const artifact of [...orderedArtifacts].reverse()) await run(options.piCommand, ["remove", "-l", "--approve", packageDirectories[artifact.id] as string]);
         // A fresh candidate runtime has no project settings before the rehearsal. Pi

@@ -93,7 +93,15 @@ The command calls `newSession({ parentSession, withSession })` once and uses onl
 
 `runExactCandidate` accepts only an external candidate root and a manifest with the lifecycle, pi-subagents, Remote Pi, and background-task archives in that order. It verifies every archive digest, npm-installs only those archives into a new candidate-root runtime, and uses documented `pi install -l --approve <archive-derived-package-directory>` operations in a disposable profile. Its matrix lists all 16 Layer-3 scenarios, records redacted receipts, bounds the soak, and, when requested, removes candidate registrations with documented Pi CLI operations before deleting only the candidate-created empty project settings directory to restore the initial absent-settings snapshot.
 
-For the integrated scenarios, every consumer package exposes an explicit `./testing` subpath with `createExactCandidateProbe({ session, seed, packageDirectory })`. The lifecycle driver resolves that subpath from the archive-derived package directory only. The probe permits only typed boundary injections and immutable opaque identifier/outcome receipts; it must not expose payloads or mutable adapter/coordinator state.
+For the integrated scenarios, every consumer package exposes an explicit `./testing` subpath with `createExactCandidateProbe({ session, seed, packageDirectory })`. The lifecycle driver resolves that subpath from the archive-derived package directory only. The probe permits only typed boundary injections and immutable opaque identifier/outcome receipts; it must not expose payloads or mutable adapter/coordinator state. The public-SDK driver loads the archive package extensions through an in-memory Pi settings manager pointing only at the same archive-derived directories; no consumer worktree or profile setting participates.
+
+Run a retained external candidate with:
+
+```sh
+npm run test:exact-candidate -- --manifest "$CANDIDATE_ROOT/candidate-manifest.json" --candidate-root "$CANDIDATE_ROOT" --seed 6607 --cycles 100 --max-duration-ms 3600000 --write-receipts "$CANDIDATE_ROOT/receipts" --rollback-rehearsal
+```
+
+The command fails closed on any package-load, probe, scenario, soak, or rollback failure. It does not report a partial matrix as a candidate verdict.
 
 The manifest validator requires full commit/tree identities, SHA-256 archive/lock digests, exact Pi version/integrity, a deterministic scenario seed, relative archive paths, and a complete unique package order. Candidate-specific values and outputs remain outside lifecycle source so they cannot create a self-referential commit identity.
 

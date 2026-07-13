@@ -60,7 +60,7 @@ describe("exact candidate consumer testing subpath", () => {
         packageDirectory,
         session: {} as AgentSession,
         seed: 6607,
-      })).rejects.toThrow(/escaped|invalid "exports" target/i);
+      })).rejects.toThrow(/escaped|relative import target/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

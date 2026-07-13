@@ -9,6 +9,7 @@ export {
   type ExactCandidateProbeReceipt,
   type ExactCandidateTestingModule,
 } from "./exact-candidate-probe.js";
+export { executeExactCandidateScenario, runExactCandidateSoakCycle } from "./exact-candidate-matrix.js";
 export {
   EXACT_CANDIDATE_SCENARIOS,
   runExactCandidate,

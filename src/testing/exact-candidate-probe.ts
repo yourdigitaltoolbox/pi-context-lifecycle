@@ -1,6 +1,5 @@
-import { createRequire } from "node:module";
-import { realpath } from "node:fs/promises";
-import { relative, sep } from "node:path";
+import { readFile, realpath } from "node:fs/promises";
+import { relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
@@ -61,9 +60,21 @@ function requireTestingModule(value: unknown): ExactCandidateTestingModule {
  * runtime, not from this lifecycle worktree. Consumers must expose that exact
  * public subpath through package exports (or an equivalent package-local file).
  */
+function testingImportTarget(packageJson: unknown): string {
+  if (typeof packageJson !== "object" || packageJson === null || !("exports" in packageJson)) throw new Error("candidate consumer package does not export ./testing");
+  const exportsField = packageJson.exports;
+  if (typeof exportsField !== "object" || exportsField === null || !("./testing" in exportsField)) throw new Error("candidate consumer package does not export ./testing");
+  const testing = exportsField["./testing"];
+  const target = typeof testing === "string"
+    ? testing
+    : typeof testing === "object" && testing !== null && "import" in testing ? testing.import : undefined;
+  if (typeof target !== "string" || !target.startsWith("./")) throw new Error("candidate consumer ./testing export must provide a relative import target");
+  return target;
+}
+
 export async function loadExactCandidateProbe(options: ExactCandidateProbeOptions & { packageName: ExactCandidateConsumer }): Promise<ExactCandidateProbe> {
-  const requireFromRuntime = createRequire(`${options.packageDirectory}/package.json`);
-  const resolvedSubpath = requireFromRuntime.resolve(`${options.packageName}/testing`);
+  const packageJson = JSON.parse(await readFile(resolve(options.packageDirectory, "package.json"), "utf8")) as unknown;
+  const resolvedSubpath = resolve(options.packageDirectory, testingImportTarget(packageJson));
   const [actualDirectory, actualSubpath] = await Promise.all([realpath(options.packageDirectory), realpath(resolvedSubpath)]);
   if (!isContained(actualDirectory, actualSubpath)) throw new Error(`candidate consumer testing subpath escaped ${options.packageName} archive directory`);
   const testingModule = requireTestingModule(await import(pathToFileURL(actualSubpath).href));

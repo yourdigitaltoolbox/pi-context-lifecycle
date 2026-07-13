@@ -119,6 +119,26 @@ describe("exact candidate runner", () => {
     }
   });
 
+  it("writes a redacted external failure receipt instead of reporting a partial scenario matrix", async () => {
+    const root = await candidateRoot();
+    try {
+      await expect(runExactCandidate({
+        candidateRoot: root,
+        manifestPath: join(root, "candidate-manifest.json"),
+        piCommand: "pi",
+        writeReceipts: join(root, "receipts"),
+        runner: archiveInstaller(),
+        executeScenario() { throw new Error("prompt or provider body must not leak"); },
+        runSoakCycle: () => undefined,
+      })).rejects.toThrow(/scenario failed/i);
+      const failure = JSON.parse(await readFile(join(root, "receipts", "exact-candidate-failure-receipt.json"), "utf8")) as { status: string; scenario: { timeline: unknown[] } };
+      expect(failure).toMatchObject({ status: "failed", scenario: { timeline: [] } });
+      expect(JSON.stringify(failure)).not.toContain("prompt or provider body");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses documented Pi removal and removes only candidate-created project settings to restore an absent snapshot", async () => {
     const root = await candidateRoot();
     try {
