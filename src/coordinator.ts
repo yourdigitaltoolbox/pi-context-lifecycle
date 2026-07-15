@@ -73,6 +73,8 @@ interface ActiveOperation {
   compactStarted: boolean;
   matchingManagedSuccessEvents: number;
   managedCompleteObserved: boolean;
+  /** Native threshold/overflow compaction adopted before this request started its own compact call. */
+  adoptedAutomaticReason?: "threshold" | "overflow";
   resumeMessageMatched: boolean;
 }
 
@@ -295,16 +297,33 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.observeSettlement("agent-settled");
     if (!this.operation) return;
     if (this.phase === "pending-settle") {
+      if (this.operation.adoptedAutomaticReason !== undefined && this.operation.managedCompleteObserved) {
+        if (this.lastOutcome === "completed" && this.operation.resume) {
+          this.phase = "resuming";
+          if (!this.persistClaim("resume-pending") || !this.persistClaim("resume-admitting")) {
+            this.block("claim-persist-failed", false);
+            return;
+          }
+          this.transition("compaction-succeeded");
+          this.scheduleResumeDeadlines(this.operation.id);
+          this.adapter?.sendResume(this.operation.resumeMessage);
+          this.record("resume-sent");
+        } else {
+          void this.release();
+        }
+        return;
+      }
       this.startCompaction();
       return;
     }
-    if (this.phase === "observed-preflight" && !this.operation.managed) {
+    if (this.phase === "observed-preflight") {
+      if (this.operation.managed && this.operation.adoptedAutomaticReason === undefined) return;
       this.lastOutcome = "failed";
       if (!this.persistClaim("failed")) {
         this.block("claim-persist-failed", false);
         return;
       }
-      this.record("automatic-compaction-failed");
+      this.record(this.operation.managed ? "adopted-automatic-compaction-failed" : "automatic-compaction-failed");
       void this.release();
       return;
     }
@@ -332,6 +351,25 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.invalidateSettlementProof();
     if (reason === "manual" && this.phase === "compacting" && this.operation?.managed) {
       this.record("managed-compaction-preflight-observed");
+      return this.operation.id;
+    }
+    if (reason !== "manual"
+      && this.phase === "pending-settle"
+      && this.operation?.managed
+      && !this.operation.compactStarted) {
+      // Pi may need native threshold/overflow compaction before the managed
+      // request reaches its settlement boundary. This preflight is observable
+      // and the later session_compact/abort/settled events are authoritative,
+      // so adopt it instead of wedging a deterministic overlap as ambiguous.
+      this.operation.compactStarted = true;
+      this.operation.adoptedAutomaticReason = reason;
+      this.phase = "observed-preflight";
+      if (!this.persistClaim("compacting")) {
+        this.block("claim-persist-failed", false);
+        return undefined;
+      }
+      this.transition("automatic-compaction-adopted-for-managed-request");
+      this.scheduleCompactionDeadlines(this.operation.id);
       return this.operation.id;
     }
     if (this.phase !== "idle" || this.operation !== undefined) {
@@ -374,6 +412,14 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
       return;
     }
     this.record(this.operation.managed ? "managed-compaction-cancelled" : "automatic-compaction-cancelled");
+    if (this.operation.adoptedAutomaticReason !== undefined) {
+      // Native compaction cancellation can fire while the enclosing run is
+      // still active. Wait for its genuine settlement before draining wakes.
+      this.operation.managedCompleteObserved = true;
+      this.phase = "pending-settle";
+      this.transition("adopted-automatic-cancellation-awaiting-settlement");
+      return;
+    }
     void this.release();
   }
 
@@ -381,7 +427,9 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     if (!this.isCurrentGeneration(generationId) || !this.operation) return;
     if (reason !== "manual") {
       const resolvesDeadlineBlock = this.phase === "blocked-unknown" && this.blockedReason === "compaction-deadline";
-      if (this.operation.managed || this.operation.reason !== reason || (this.phase !== "observed-preflight" && !resolvesDeadlineBlock)) {
+      const adoptedManaged = this.operation.managed && this.operation.adoptedAutomaticReason === reason;
+      if ((!adoptedManaged && (this.operation.managed || this.operation.reason !== reason))
+        || (this.phase !== "observed-preflight" && !resolvesDeadlineBlock)) {
         this.block("automatic-compaction-event-mismatch");
         return;
       }
@@ -391,8 +439,17 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         this.block("claim-persist-failed", false);
         return;
       }
-      this.record(resolvesDeadlineBlock ? "late-automatic-compaction-success" : "automatic-compaction-succeeded");
-      void this.release(resolvesDeadlineBlock);
+      if (!adoptedManaged) {
+        this.record(resolvesDeadlineBlock ? "late-automatic-compaction-success" : "automatic-compaction-succeeded");
+        void this.release(resolvesDeadlineBlock);
+        return;
+      }
+      this.operation.managedCompleteObserved = true;
+      this.record(resolvesDeadlineBlock ? "late-adopted-automatic-compaction-success" : "adopted-automatic-compaction-succeeded");
+      // Native automatic compaction may finish inside the still-active agent
+      // loop. Defer resume/release until that enclosing run genuinely settles.
+      this.phase = "pending-settle";
+      this.transition("adopted-automatic-compaction-awaiting-settlement");
       return;
     }
     const resolvesDeadlineBlock = this.phase === "blocked-unknown" && this.blockedReason === "compaction-deadline";
@@ -706,7 +763,10 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   }
 
   private async release(fromBlockedRepair = false, retryBlockedDrainer = false): Promise<void> {
-    if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting" && this.phase !== "observed-preflight" && !(fromBlockedRepair && this.phase === "blocked-unknown"))) return;
+    const adoptedTerminalAtSettlement = this.phase === "pending-settle"
+      && this.operation?.adoptedAutomaticReason !== undefined
+      && this.operation.managedCompleteObserved;
+    if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting" && this.phase !== "observed-preflight" && !adoptedTerminalAtSettlement && !(fromBlockedRepair && this.phase === "blocked-unknown"))) return;
     this.clearAllDeadlines();
     this.blockedReason = undefined;
     this.blockedDrainerConsumerId = undefined;

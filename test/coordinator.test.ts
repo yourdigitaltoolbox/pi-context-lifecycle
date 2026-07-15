@@ -242,6 +242,93 @@ describe("managed lifecycle coordinator", () => {
     expect(test.sendResume).not.toHaveBeenCalled();
   });
 
+  it("adopts native automatic compaction while a managed request is pending, resumes, and releases held work", async () => {
+    const test = setup();
+    const drained: string[] = [];
+    test.coordinator.registerDrainer({
+      consumerId: "consumer",
+      laneId: TEST_LANE,
+      generationId: test.generationId,
+      capture: () => ({ watermark: 1, heldCount: 1 }),
+      drain(permit) {
+        drained.push("held-message");
+        return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "submitted", submittedCount: 1, handledCount: 1, handledThrough: permit.cut.watermark };
+      },
+    });
+    const accepted = test.coordinator.requestSelfCompaction("", "tool");
+    const operationId = accepted.disposition === "accepted" ? accepted.operationId : "missing";
+    expect(test.registry.snapshot().phase).toBe("pending-settle");
+
+    expect(test.coordinator.onSessionBeforeCompact(test.generationId, "threshold")).toBe(operationId);
+    expect(test.registry.snapshot()).toMatchObject({ phase: "observed-preflight", reason: "self" });
+    expect(test.compact).not.toHaveBeenCalled();
+    expect(test.appendLifecycleEntry.mock.calls.map(([claim]) => claim.state)).toEqual(["requested", "compacting"]);
+
+    test.coordinator.onSessionCompact(test.generationId, "threshold");
+    expect(test.registry.snapshot()).toMatchObject({ phase: "pending-settle", lastOutcome: "completed" });
+    expect(test.sendResume).not.toHaveBeenCalled();
+    test.coordinator.onAgentSettled(test.generationId);
+    expect(test.registry.snapshot()).toMatchObject({ phase: "resuming", lastOutcome: "completed" });
+    expect(test.sendResume).toHaveBeenCalledTimes(1);
+    const resume = test.sendResume.mock.calls[0]?.[0] ?? "";
+    test.coordinator.onMessageStart(test.generationId, { role: "user", content: resume });
+    test.coordinator.onAgentSettled(test.generationId);
+    await vi.waitFor(() => expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" }));
+    expect(drained).toEqual(["held-message"]);
+    expect(test.appendLifecycleEntry.mock.calls.map(([claim]) => claim.state)).toEqual([
+      "requested", "compacting", "compacted", "resume-pending", "resume-admitting", "resume-admitted", "resume-settled", "released",
+    ]);
+  });
+
+  it("terminalizes an adopted automatic compaction that settles without success", async () => {
+    const test = setup();
+    const drained: string[] = [];
+    test.coordinator.registerDrainer({
+      consumerId: "consumer",
+      laneId: TEST_LANE,
+      generationId: test.generationId,
+      capture: () => ({ watermark: 1, heldCount: 1 }),
+      drain(permit) {
+        drained.push("held-message");
+        return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "submitted", submittedCount: 1, handledCount: 1, handledThrough: permit.cut.watermark };
+      },
+    });
+    test.coordinator.requestSelfCompaction("", "tool");
+    test.coordinator.onSessionBeforeCompact(test.generationId, "overflow");
+
+    test.coordinator.onAgentSettled(test.generationId);
+    await vi.waitFor(() => expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "failed" }));
+    expect(test.compact).not.toHaveBeenCalled();
+    expect(test.sendResume).not.toHaveBeenCalled();
+    expect(drained).toEqual(["held-message"]);
+    expect(test.coordinator.diagnostics()).toContainEqual(expect.objectContaining({ code: "adopted-automatic-compaction-failed", outcome: "failed" }));
+  });
+
+  it("waits for settlement before releasing an adopted automatic cancellation", async () => {
+    const test = setup();
+    const drained: string[] = [];
+    test.coordinator.registerDrainer({
+      consumerId: "consumer",
+      laneId: TEST_LANE,
+      generationId: test.generationId,
+      capture: () => ({ watermark: 1, heldCount: 1 }),
+      drain(permit) {
+        drained.push("held-message");
+        return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "submitted", submittedCount: 1, handledCount: 1, handledThrough: permit.cut.watermark };
+      },
+    });
+    test.coordinator.requestSelfCompaction("", "tool");
+    const operationId = test.coordinator.onSessionBeforeCompact(test.generationId, "threshold") ?? "missing";
+
+    test.coordinator.onCompactionCancelled(test.generationId, operationId);
+    expect(test.registry.snapshot()).toMatchObject({ phase: "pending-settle", lastOutcome: "cancelled" });
+    expect(drained).toEqual([]);
+    test.coordinator.onAgentSettled(test.generationId);
+    await vi.waitFor(() => expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "cancelled" }));
+    expect(test.sendResume).not.toHaveBeenCalled();
+    expect(drained).toEqual(["held-message"]);
+  });
+
   it("lets late durable automatic success resolve the current compaction block", async () => {
     vi.useFakeTimers();
     try {

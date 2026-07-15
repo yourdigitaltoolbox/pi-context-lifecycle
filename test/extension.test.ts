@@ -198,6 +198,30 @@ describe("Pi extension tracer", () => {
     expect(test.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  it("adopts automatic compaction that overtakes a pending self tool and resumes once", async () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+    await test.getTool()?.execute("tool-call", {}, undefined, undefined, test.context);
+    expect(getContextLifecycleSnapshotV1().phase).toBe("pending-settle");
+
+    test.emit("session_before_compact", { type: "session_before_compact", reason: "threshold", willRetry: false, signal: new AbortController().signal });
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "observed-preflight", reason: "self" });
+    expect(test.compact).not.toHaveBeenCalled();
+    test.emit("session_compact", { type: "session_compact", reason: "threshold", fromExtension: false, willRetry: false });
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "pending-settle", lastOutcome: "completed" });
+    expect(test.sendUserMessage).not.toHaveBeenCalled();
+    test.emit("agent_settled", { type: "agent_settled" });
+    expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "resuming", lastOutcome: "completed" });
+    expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    const resume = test.sendUserMessage.mock.calls[0]?.[0] as string;
+    test.emit("message_start", { type: "message_start", message: { role: "user", content: resume } });
+    test.emit("agent_settled", { type: "agent_settled" });
+    await vi.waitFor(() => expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" }));
+    expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("classifies an automatic compaction abort signal as cancelled", async () => {
     const test = harness();
     contextLifecycleExtension(test.api);
