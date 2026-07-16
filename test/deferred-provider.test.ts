@@ -39,6 +39,18 @@ describe("deferred fake provider tracker", () => {
     expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, inFlight: 0, maxInFlight: 1 });
   });
 
+  it("settles a held response as cancelled when the public provider signal aborts", async () => {
+    const provider = createDeferredFakeProvider();
+    const response = provider.enqueue(fauxAssistantMessage("unused"), { label: "agent-initial" });
+    const controller = new AbortController();
+    const stream = provider.streamSimple(provider.getModel(), context, { signal: controller.signal });
+    await response.call;
+    controller.abort();
+    await stream.result();
+    await expect(response.completed).resolves.toMatchObject({ outcome: "cancelled" });
+    expect(provider.tracker).toMatchObject({ entered: 1, completed: 1, inFlight: 0, maxInFlight: 1 });
+  });
+
   it("settles a pre-compaction producer response before the self_compact response may enter", async () => {
     const provider = createDeferredFakeProvider();
     const producer = provider.enqueue(fauxAssistantMessage("redacted producer completion"), { label: "pre-compaction-producer" });

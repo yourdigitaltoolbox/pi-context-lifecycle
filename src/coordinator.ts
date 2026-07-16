@@ -141,6 +141,8 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private readonly activePermits = new Set<ReleasePermit>();
   private releaseCut: CapturedDrainer[] | undefined;
   private releaseIndex = 0;
+  /** Settlement epoch that must be exceeded before the next submitted cut drains. */
+  private releaseAwaitingSettlementEpoch: number | undefined;
   private blockedDrainerConsumerId: string | undefined;
   private blockedDrainerLaneId: LifecycleLane | undefined;
   private compactionWarningTimer: ReturnType<typeof setTimeout> | undefined;
@@ -332,6 +334,16 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         this.block("claim-persist-failed", false);
         return;
       }
+      void this.release();
+      return;
+    }
+    // A submitted drain starts exactly one Pi turn. Do not admit another
+    // drainer (or return idle) until that same-generation turn settles.
+    if (this.phase === "releasing"
+      && this.releaseAwaitingSettlementEpoch !== undefined
+      && this.settlementEpoch > this.releaseAwaitingSettlementEpoch) {
+      this.releaseAwaitingSettlementEpoch = undefined;
+      this.releaseIndex += 1;
       void this.release();
     }
   }
@@ -713,6 +725,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.drainers.clear();
     this.releaseCut = undefined;
     this.releaseIndex = 0;
+    this.releaseAwaitingSettlementEpoch = undefined;
     this.blockedDrainerConsumerId = undefined;
     this.blockedDrainerLaneId = undefined;
     this.phase = undefined;
@@ -766,13 +779,15 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     const adoptedTerminalAtSettlement = this.phase === "pending-settle"
       && this.operation?.adoptedAutomaticReason !== undefined
       && this.operation.managedCompleteObserved;
-    if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting" && this.phase !== "observed-preflight" && !adoptedTerminalAtSettlement && !(fromBlockedRepair && this.phase === "blocked-unknown"))) return;
+    const continuingRelease = this.phase === "releasing";
+    if (!this.operation || !this.sessionId || !this.generationId || (this.phase !== "resuming" && this.phase !== "compacting" && this.phase !== "observed-preflight" && !adoptedTerminalAtSettlement && !(fromBlockedRepair && this.phase === "blocked-unknown") && !continuingRelease)) return;
+    if (continuingRelease && this.releaseAwaitingSettlementEpoch !== undefined) return;
     this.clearAllDeadlines();
     this.blockedReason = undefined;
     this.blockedDrainerConsumerId = undefined;
     this.blockedDrainerLaneId = undefined;
     this.phase = "releasing";
-    if (!retryBlockedDrainer) {
+    if (!retryBlockedDrainer && !continuingRelease) {
       const registrations = [...this.drainers.values()].sort((left, right) => (LANE_ORDER.get(left.laneId) ?? Number.MAX_SAFE_INTEGER) - (LANE_ORDER.get(right.laneId) ?? Number.MAX_SAFE_INTEGER) || left.consumerId.localeCompare(right.consumerId));
       try {
         this.releaseCut = registrations.map((registration) => {
@@ -807,6 +822,9 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         cut: captured.cut,
       });
       this.activePermits.add(permit);
+      // Capture before drain() so a settlement during submission but before
+      // its acknowledgement is processed satisfies the barrier.
+      const submissionSettlementEpoch = this.settlementEpoch;
       let pendingAck: Promise<DrainAck> | DrainAck;
       try {
         pendingAck = drainer.drain(permit);
@@ -833,17 +851,26 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
         return;
       }
       const ack = outcome.ack;
+      const disposition: unknown = (ack as { disposition?: unknown }).disposition;
       if (ack.releaseId !== permit.releaseId
         || ack.consumerId !== permit.consumerId
         || ack.laneId !== permit.laneId
         || !Number.isSafeInteger(ack.submittedCount) || ack.submittedCount < 0
         || !Number.isSafeInteger(ack.handledCount) || ack.handledCount !== permit.cut.heldCount
         || ack.handledThrough !== permit.cut.watermark
-        || (ack.disposition === "empty" && permit.cut.heldCount !== 0)
-        || ack.disposition === "blocked") {
+        || (disposition !== "empty" && disposition !== "submitted" && disposition !== "blocked")
+        || (disposition === "empty" && (permit.cut.heldCount !== 0 || ack.submittedCount !== 0))
+        || (disposition === "submitted" && (permit.cut.heldCount === 0 || ack.submittedCount !== 1))
+        || (disposition === "blocked" && ack.submittedCount !== 0)
+        || disposition === "blocked") {
         this.blockedDrainerConsumerId = drainer.consumerId;
         this.blockedDrainerLaneId = drainer.laneId;
         this.block("drainer-blocked");
+        return;
+      }
+      if (disposition === "submitted" && this.settlementEpoch <= submissionSettlementEpoch) {
+        this.releaseAwaitingSettlementEpoch = submissionSettlementEpoch;
+        this.record("release-submission-awaiting-settlement");
         return;
       }
       this.releaseIndex += 1;
@@ -856,6 +883,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
     this.operation = undefined;
     this.releaseCut = undefined;
     this.releaseIndex = 0;
+    this.releaseAwaitingSettlementEpoch = undefined;
     this.phase = "idle";
     this.transition("release-completed");
   }
@@ -863,6 +891,7 @@ export class ContextLifecycleCoordinatorV1 implements CoordinatorPublisherV1 {
   private block(code: string, persist = true): void {
     if (this.phase === "blocked-unknown") return;
     this.clearAllDeadlines();
+    this.releaseAwaitingSettlementEpoch = undefined;
     this.blockedReason = code;
     this.phase = "blocked-unknown";
     if (persist) this.persistClaim("blocked-unknown");

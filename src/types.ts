@@ -127,6 +127,11 @@ export interface DrainAck {
   consumerId: string;
   laneId: LifecycleLane;
   disposition: "empty" | "submitted" | "blocked";
+  /**
+   * V1 submission receipt: 0 for empty or blocked drains, and exactly 1
+   * for a submitted non-empty drain. A submitted receipt represents one Pi
+   * sendMessage(..., { triggerTurn: true }) invocation.
+   */
   submittedCount: number;
   handledCount: number;
   handledThrough: number;

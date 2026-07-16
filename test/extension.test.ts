@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ManagedCompactionAdapter } from "../src/coordinator.js";
 import contextLifecycleExtension from "../src/extension.js";
-import { getContextLifecycleSnapshotV1, requestCompaction } from "../src/registry.js";
+import { getContextLifecycleSnapshotV1, registerContextLifecycleDrainerV1, requestCompaction } from "../src/registry.js";
 import { CONTEXT_LIFECYCLE_REGISTRY_SYMBOL } from "../src/types.js";
 
 interface RegisteredToolLike {
@@ -98,6 +98,33 @@ describe("Pi extension tracer", () => {
     test.emit("agent_settled", { type: "agent_settled" });
     expect(getContextLifecycleSnapshotV1().phase).toBe("idle");
     expect(test.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an extension-submitted release in releasing until its Pi turn settles", async () => {
+    const test = harness();
+    contextLifecycleExtension(test.api);
+    test.emit("session_start", { type: "session_start", reason: "startup" });
+    const snapshot = getContextLifecycleSnapshotV1();
+    const drained: string[] = [];
+    registerContextLifecycleDrainerV1({
+      consumerId: "extension-consumer",
+      laneId: "background-notify",
+      generationId: snapshot.generationId ?? "",
+      capture: () => ({ watermark: 1, heldCount: 1 }),
+      drain(permit) {
+        drained.push(permit.releaseId);
+        return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "submitted", submittedCount: 1, handledCount: 1, handledThrough: permit.cut.watermark };
+      },
+    });
+    requestCompaction({ requestId: "remote", sessionId: snapshot.sessionId ?? "", generationId: snapshot.generationId ?? "", reason: "remote" });
+    test.emit("agent_settled", { type: "agent_settled" });
+    test.emit("session_compact", { type: "session_compact", reason: "manual" });
+    test.compact.mock.calls[0]?.[0].onComplete();
+    await vi.waitFor(() => expect(drained).toHaveLength(1));
+    expect(getContextLifecycleSnapshotV1().phase).toBe("releasing");
+
+    test.emit("agent_settled", { type: "agent_settled" });
+    await vi.waitFor(() => expect(getContextLifecycleSnapshotV1().phase).toBe("idle"));
   });
 
   it("starts only an internally attested Remote request from session-start proof and invalidates at public activity seams", () => {

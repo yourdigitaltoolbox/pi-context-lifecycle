@@ -13,7 +13,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import contextLifecycleExtension from "../../src/extension.js";
 import { createDeferredFakeProvider, createDisposableHarnessRoots, withDisposableHarnessEnvironment } from "../../src/testing/index.js";
-import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, requestCompaction } from "../../src/registry.js";
+import { getContextLifecycleDiagnosticsV1, getContextLifecycleSnapshotV1, registerContextLifecycleDrainerV1, requestCompaction } from "../../src/registry.js";
 import { CONTEXT_LIFECYCLE_REGISTRY_SYMBOL } from "../../src/types.js";
 
 interface TimelineEvent { index: number; type: string; role?: string; entryType?: string }
@@ -108,6 +108,119 @@ describe("public SDK managed tracer", () => {
           await session.waitForIdle();
           expect(events).toEqual(["start", "start", "settled", "settled"]);
           expect(provider.tracker).toMatchObject({ entered: 2, completed: 2, inFlight: 0, maxInFlight: 1 });
+        } finally {
+          unsubscribe();
+          session.dispose();
+        }
+      });
+    } finally {
+      await roots.cleanup();
+    }
+  });
+
+  it("settles each submitted release turn before invoking the next public drainer", async () => {
+    const roots = await createDisposableHarnessRoots();
+    try {
+      await withDisposableHarnessEnvironment(roots, async () => {
+        const provider = createDeferredFakeProvider();
+        const historySummary = provider.enqueue(fauxAssistantMessage("Serialized release history summary."), { label: "compaction-history" });
+        const turnSummary = provider.enqueue(fauxAssistantMessage("Serialized release turn summary."), { label: "compaction-turn" });
+        const producerDrains = provider.enqueueProducerDrain(fauxAssistantMessage("Released producer turn."));
+        const firstDrain = await producerDrains.responseAt(0);
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_000 } });
+        const submissions: string[] = [];
+        const providerExtension = (pi: ExtensionAPI) => {
+          pi.registerProvider(provider.provider, {
+            api: provider.api,
+            apiKey: "disposable-test-key",
+            baseUrl: "http://localhost.invalid",
+            models: provider.models.map((model) => ({ id: model.id, name: model.name, api: model.api, reasoning: model.reasoning, input: model.input, cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens })),
+            streamSimple: (model, context, options) => provider.streamSimple(model, context, options),
+          });
+        };
+        const drainerExtension = (pi: ExtensionAPI) => {
+          pi.on("session_start", () => {
+            const snapshot = getContextLifecycleSnapshotV1();
+            for (const laneId of ["failure-attention-decision", "mesh-reply"] as const) {
+              registerContextLifecycleDrainerV1({
+                consumerId: `real-${laneId}`,
+                laneId,
+                generationId: snapshot.generationId ?? "",
+                capture: () => ({ watermark: 1, heldCount: 1 }),
+                drain(permit) {
+                  submissions.push(laneId);
+                  pi.sendMessage({ customType: `real-release-${laneId}`, content: "redacted", display: false }, { triggerTurn: true });
+                  return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "submitted", submittedCount: 1, handledCount: 1, handledThrough: permit.cut.watermark };
+                },
+              });
+            }
+          });
+        };
+        const loader = new DefaultResourceLoader({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          settingsManager,
+          extensionFactories: [providerExtension, contextLifecycleExtension, drainerExtension],
+        });
+        await loader.reload();
+        const sessionManager = SessionManager.create(roots.cwd, roots.sessions);
+        for (let index = 0; index < 5; index += 1) {
+          sessionManager.appendMessage({ role: "user", content: `serialized-history-${index} ${"u".repeat(4_000)}`, timestamp: Date.now() });
+          sessionManager.appendMessage(fauxAssistantMessage(`serialized-response-${index} ${"a".repeat(4_000)}`));
+        }
+        const { session } = await createAgentSession({
+          cwd: roots.cwd,
+          agentDir: roots.agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          sessionManager,
+          model: provider.getModel(),
+          tools: [],
+        });
+        await session.bindExtensions({ mode: "print" });
+        const events: string[] = [];
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "agent_start" || event.type === "agent_settled" || event.type === "compaction_start" || event.type === "compaction_end") events.push(event.type);
+        });
+        try {
+          const snapshot = getContextLifecycleSnapshotV1();
+          expect(requestCompaction({
+            requestId: "serialized-release-request",
+            sessionId: snapshot.sessionId ?? "",
+            generationId: snapshot.generationId ?? "",
+            reason: "remote",
+            source: "remote-pi-action",
+            actor: "operator",
+            channel: "remote",
+            settlementPolicy: "current-or-next-settled-boundary",
+          })).toMatchObject({ disposition: "accepted" });
+          await historySummary.call;
+          historySummary.release();
+          await turnSummary.call;
+          turnSummary.release();
+
+          await firstDrain.call;
+          const secondDrain = await producerDrains.responseAt(1);
+          expect(submissions).toEqual(["failure-attention-decision"]);
+          expect(getContextLifecycleSnapshotV1().phase).toBe("releasing");
+          expect(provider.tracker).toMatchObject({ inFlight: 1, maxInFlight: 1 });
+          firstDrain.release();
+          await firstDrain.completed;
+
+          await secondDrain.call;
+          expect(submissions).toEqual(["failure-attention-decision", "mesh-reply"]);
+          expect(getContextLifecycleSnapshotV1().phase).toBe("releasing");
+          expect(provider.tracker).toMatchObject({ inFlight: 1, maxInFlight: 1 });
+          secondDrain.release();
+          await secondDrain.completed;
+          await session.waitForIdle();
+          await vi.waitFor(() => expect(getContextLifecycleSnapshotV1()).toMatchObject({ phase: "idle", lastOutcome: "completed" }), { timeout: 5_000 });
+          expect(events.filter((event) => event === "agent_settled")).toHaveLength(2);
+          expect(provider.tracker).toMatchObject({ entered: 4, completed: 4, inFlight: 0, maxInFlight: 1 });
         } finally {
           unsubscribe();
           session.dispose();

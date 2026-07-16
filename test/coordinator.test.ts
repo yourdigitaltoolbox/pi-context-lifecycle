@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ContextLifecycleCoordinatorV1, type ManagedCompactionAdapter } from "../src/coordinator.js";
 import { registryForHost } from "../src/registry.js";
 import { CONTEXT_LIFECYCLE_RELEASE_LANES } from "../src/types.js";
-import type { CompactRequest, LifecycleClaim, ReleasePermit, WakeAdmission } from "../src/types.js";
+import type { CompactRequest, DrainAck, LifecycleClaim, ReleasePermit, WakeAdmission } from "../src/types.js";
 
 const TEST_LANE = "background-notify" as const;
 
@@ -273,6 +273,8 @@ describe("managed lifecycle coordinator", () => {
     const resume = test.sendResume.mock.calls[0]?.[0] ?? "";
     test.coordinator.onMessageStart(test.generationId, { role: "user", content: resume });
     test.coordinator.onAgentSettled(test.generationId);
+    // The submitted held wake starts a new Pi turn, which must settle before idle.
+    test.coordinator.onAgentSettled(test.generationId);
     await vi.waitFor(() => expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "completed" }));
     expect(drained).toEqual(["held-message"]);
     expect(test.appendLifecycleEntry.mock.calls.map(([claim]) => claim.state)).toEqual([
@@ -296,6 +298,7 @@ describe("managed lifecycle coordinator", () => {
     test.coordinator.requestSelfCompaction("", "tool");
     test.coordinator.onSessionBeforeCompact(test.generationId, "overflow");
 
+    test.coordinator.onAgentSettled(test.generationId);
     test.coordinator.onAgentSettled(test.generationId);
     await vi.waitFor(() => expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "failed" }));
     expect(test.compact).not.toHaveBeenCalled();
@@ -323,6 +326,7 @@ describe("managed lifecycle coordinator", () => {
     test.coordinator.onCompactionCancelled(test.generationId, operationId);
     expect(test.registry.snapshot()).toMatchObject({ phase: "pending-settle", lastOutcome: "cancelled" });
     expect(drained).toEqual([]);
+    test.coordinator.onAgentSettled(test.generationId);
     test.coordinator.onAgentSettled(test.generationId);
     await vi.waitFor(() => expect(test.registry.snapshot()).toMatchObject({ phase: "idle", lastOutcome: "cancelled" }));
     expect(test.sendResume).not.toHaveBeenCalled();
@@ -608,6 +612,91 @@ describe("managed lifecycle coordinator", () => {
     expect(drained).toEqual(CONTEXT_LIFECYCLE_RELEASE_LANES);
   });
 
+  it("serializes three submitted drainers by stable lane order until each submitted turn settles", async () => {
+    const test = setup();
+    const drained: string[] = [];
+    const lanes = ["loop-tick", "mesh-reply", "failure-attention-decision"] as const;
+    for (const laneId of lanes) {
+      test.coordinator.registerDrainer({
+        consumerId: `consumer-${laneId}`,
+        laneId,
+        generationId: test.generationId,
+        capture: () => ({ watermark: 1, heldCount: 1 }),
+        drain(permit) {
+          drained.push(permit.laneId);
+          return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "submitted", submittedCount: 1, handledCount: 1, handledThrough: permit.cut.watermark };
+        },
+      });
+    }
+    test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+    test.coordinator.onAgentSettled(test.generationId);
+    completeManagedCompaction(test);
+    await vi.waitFor(() => expect(drained).toEqual(["failure-attention-decision"]));
+    expect(test.registry.snapshot().phase).toBe("releasing");
+
+    test.coordinator.onAgentSettled("stale-generation");
+    await Promise.resolve();
+    expect(drained).toEqual(["failure-attention-decision"]);
+    expect(test.registry.snapshot().phase).toBe("releasing");
+
+    test.coordinator.onAgentSettled(test.generationId);
+    await vi.waitFor(() => expect(drained).toEqual(["failure-attention-decision", "mesh-reply"]));
+    expect(test.registry.snapshot().phase).toBe("releasing");
+    test.coordinator.onAgentSettled(test.generationId);
+    await vi.waitFor(() => expect(drained).toEqual(["failure-attention-decision", "mesh-reply", "loop-tick"]));
+    expect(test.registry.snapshot().phase).toBe("releasing");
+    test.coordinator.onAgentSettled(test.generationId);
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
+  });
+
+  it("accepts a same-generation settlement observed after submission but before its async acknowledgement", async () => {
+    const test = setup();
+    let acknowledge!: () => void;
+    const drained: string[] = [];
+    test.coordinator.registerDrainer({
+      consumerId: "consumer",
+      laneId: TEST_LANE,
+      generationId: test.generationId,
+      capture: () => ({ watermark: 1, heldCount: 1 }),
+      drain(permit) {
+        drained.push("submitted");
+        return new Promise<DrainAck>((resolve) => {
+          acknowledge = () => resolve({ releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition: "submitted", submittedCount: 1, handledCount: 1, handledThrough: permit.cut.watermark });
+        });
+      },
+    });
+    test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+    test.coordinator.onAgentSettled(test.generationId);
+    completeManagedCompaction(test);
+    await vi.waitFor(() => expect(drained).toEqual(["submitted"]));
+
+    test.coordinator.onAgentSettled(test.generationId);
+    acknowledge();
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
+  });
+
+  it.each([
+    { disposition: "empty", submittedCount: 1, heldCount: 0 },
+    { disposition: "submitted", submittedCount: 0, heldCount: 1 },
+    { disposition: "blocked", submittedCount: 1, heldCount: 1 },
+    { disposition: "unknown" as DrainAck["disposition"], submittedCount: 1, heldCount: 1 },
+  ] as const)("blocks malformed $disposition drain acknowledgement counts", async ({ disposition, submittedCount, heldCount }) => {
+    const test = setup();
+    test.coordinator.registerDrainer({
+      consumerId: "consumer",
+      laneId: TEST_LANE,
+      generationId: test.generationId,
+      capture: () => ({ watermark: heldCount, heldCount }),
+      drain(permit) {
+        return { releaseId: permit.releaseId, consumerId: permit.consumerId, laneId: permit.laneId, disposition, submittedCount, handledCount: heldCount, handledThrough: permit.cut.watermark };
+      },
+    });
+    test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
+    test.coordinator.onAgentSettled(test.generationId);
+    completeManagedCompaction(test);
+    await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("blocked-unknown"));
+  });
+
   it("captures one finite consumer watermark cut and does not absorb a post-cut arrival", async () => {
     const test = setup();
     const held = [{ sequence: 1, id: "A" }];
@@ -638,6 +727,7 @@ describe("managed lifecycle coordinator", () => {
     test.coordinator.requestCompaction({ requestId: "remote", sessionId: "session", generationId: test.generationId, reason: "remote" });
     test.coordinator.onAgentSettled(test.generationId);
     completeManagedCompaction(test);
+    test.coordinator.onAgentSettled(test.generationId);
     await vi.waitFor(() => expect(test.registry.snapshot().phase).toBe("idle"));
 
     expect(held).toEqual([{ sequence: 2, id: "B" }]);

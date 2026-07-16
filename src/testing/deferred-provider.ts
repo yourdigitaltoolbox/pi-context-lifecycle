@@ -159,16 +159,27 @@ export function createDeferredFakeProvider(options: RegisterFauxProviderOptions 
     pendingRequests.push(request);
     let terminal = false;
     core.appendResponses([
-      async (_context, _streamOptions, state) => {
+      async (_context, streamOptions, state) => {
         request.repeat?.();
+        const signal = streamOptions?.signal;
+        let abortListener: (() => void) | undefined;
         try {
-          await gate;
+          const abortGate = signal
+            ? new Promise<void>((_resolve, reject) => {
+                abortListener = () => reject(new DeferredProviderCancellation());
+                signal.addEventListener("abort", abortListener, { once: true });
+                if (signal.aborted) abortListener();
+              })
+            : undefined;
+          if (abortGate) await Promise.race([gate, abortGate]);
+          else await gate;
           if (response === undefined) throw new Error("deterministic deferred provider failure");
           return response;
         } catch (error) {
           request.outcome = error instanceof DeferredProviderCancellation ? "cancelled" : "failed";
           throw error;
         } finally {
+          if (signal && abortListener) signal.removeEventListener("abort", abortListener);
           request.observeFactoryReturned({ callCount: state.callCount, label });
         }
       },
