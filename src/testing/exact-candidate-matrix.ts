@@ -605,67 +605,38 @@ export async function executeExactCandidateScenario(context: ExactCandidateScena
           provider.tracker.assertNoOverlap();
           let producerIndex = 0;
           const drainDeadline = Date.now() + 10_000;
-          if (traceAllProducers) {
-            // The all-producer finite-cut proof additionally establishes that
-            // all release receipts can arrive while the first real producer
-            // request stays held.
-            await releases;
-            provider.tracker.assertNoOverlap();
+          // The settlement barrier intentionally prevents later drainers from
+          // producing release receipts while the first submitted turn is still
+          // active. Settle each real public stream in order, then let the next
+          // genuine agent_settled boundary advance the finite cut. Awaiting all
+          // receipts before releasing the first stream would deadlock the proof
+          // against the production contract it is meant to verify.
+          const releaseStates = new Set<"completed" | "failed">();
+          // Observe rejection now so a failing archive receipt cannot become
+          // an unhandled rejection while the bounded stream driver waits.
+          void releases.then(() => { releaseStates.add("completed"); }, () => { releaseStates.add("failed"); });
+          drainReleasedStreams: for (;;) {
+            const producerDrain = await producerDrains.responseAt(producerIndex);
+            await waitFor(producerDrain.call, `producer drain ${producerIndex} provider call`);
+            producerDrain.release();
+            await waitFor(producerDrain.completed, `producer drain ${producerIndex} completion`);
+            const next = await producerDrains.responseAt(producerIndex + 1);
             for (;;) {
-              const producerDrain = await producerDrains.responseAt(producerIndex);
-              await waitFor(producerDrain.call, `producer drain ${producerIndex} provider call`);
-              producerDrain.release();
-              await waitFor(producerDrain.completed, `producer drain ${producerIndex} completion`);
-              const next = await producerDrains.responseAt(producerIndex + 1);
-              let nextEntered = false;
-              while (!nextEntered && Date.now() < drainDeadline) {
-                nextEntered = await Promise.race([
-                  next.call.then(() => true),
-                  new Promise<false>((resolve) => setTimeout(resolve, actualProducerSubmissions.length === producerBatches.length ? 50 : 10)),
-                ]);
-                if (actualProducerSubmissions.length === producerBatches.length && !nextEntered) break;
+              if (Date.now() >= drainDeadline) {
+                throw new Error(`${context.scenarioId} did not expose all expected producer batches/releases before quiescence: observed=${actualProducerSubmissions.length} expected=${producerBatches.length} releaseState=${[...releaseStates].join(",") || "pending"}`);
               }
+              const nextEntered = await Promise.race([
+                next.call.then(() => true),
+                new Promise<false>((resolve) => setTimeout(resolve, releaseStates.has("completed") && actualProducerSubmissions.length === producerBatches.length ? 50 : 10)),
+              ]);
               if (nextEntered) {
                 producerIndex += 1;
-                continue;
+                continue drainReleasedStreams;
               }
-              if (actualProducerSubmissions.length !== producerBatches.length) {
-                throw new Error(`${context.scenarioId} did not expose all expected producer batches before quiescence: observed=${actualProducerSubmissions.length} expected=${producerBatches.length}`);
-              }
-              break;
-            }
-          } else {
-            // These real adapters can await the preceding follow-up turn
-            // before they acknowledge the next release. Settle each observed
-            // public stream in order; do not hold an earlier response and
-            // deadlock the later production drainer.
-            const releaseStates = new Set<"completed" | "failed">();
-            // Observe rejection now so a failing archive receipt cannot become
-            // an unhandled rejection while the bounded stream driver waits.
-            void releases.then(() => { releaseStates.add("completed"); }, () => { releaseStates.add("failed"); });
-            drainReleasedStreams: for (;;) {
-              const producerDrain = await producerDrains.responseAt(producerIndex);
-              await waitFor(producerDrain.call, `producer drain ${producerIndex} provider call`);
-              producerDrain.release();
-              await waitFor(producerDrain.completed, `producer drain ${producerIndex} completion`);
-              const next = await producerDrains.responseAt(producerIndex + 1);
-              for (;;) {
-                if (Date.now() >= drainDeadline) {
-                  throw new Error(`${context.scenarioId} did not expose all expected producer batches/releases before quiescence: observed=${actualProducerSubmissions.length} expected=${producerBatches.length} releaseState=${[...releaseStates].join(",") || "pending"}`);
-                }
-                const nextEntered = await Promise.race([
-                  next.call.then(() => true),
-                  new Promise<false>((resolve) => setTimeout(resolve, releaseStates.has("completed") && actualProducerSubmissions.length === producerBatches.length ? 50 : 10)),
-                ]);
-                if (nextEntered) {
-                  producerIndex += 1;
-                  continue drainReleasedStreams;
-                }
-                if (releaseStates.has("failed")) await releases;
-                if (releaseStates.has("completed") && actualProducerSubmissions.length === producerBatches.length) {
-                  await releases;
-                  break drainReleasedStreams;
-                }
+              if (releaseStates.has("failed")) await releases;
+              if (releaseStates.has("completed") && actualProducerSubmissions.length === producerBatches.length) {
+                await releases;
+                break drainReleasedStreams;
               }
             }
           }
